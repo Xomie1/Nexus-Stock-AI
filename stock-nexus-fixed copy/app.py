@@ -447,9 +447,18 @@ _fetch_yf_seeds(EU_STOCKS, EU_SEEDS, "EU")
 _fetch_yf_seeds(ASIA_STOCKS, ASIA_SEEDS, "ASIA")
 _fetch_live_us_seeds()
 
-market_eu = {s["id"]: {**EU_SEEDS.get(s["id"], {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})} for s in EU_STOCKS}
-market_as = {s["id"]: {**ASIA_SEEDS.get(s["id"], {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})} for s in ASIA_STOCKS}
-market_us = {s["id"]: {**US_SEEDS.get(s["id"], {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})} for s in US_STOCKS}
+def _init_market(seeds, stocks, defaults):
+    """Build market dict with open price stored for change% accumulation."""
+    result = {}
+    for s in stocks:
+        d = {**seeds.get(s["id"], defaults)}
+        d.setdefault("open", d.get("price", 100))   # session open reference
+        result[s["id"]] = d
+    return result
+
+market_eu = _init_market(EU_SEEDS,   EU_STOCKS,   {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})
+market_as = _init_market(ASIA_SEEDS, ASIA_STOCKS, {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})
+market_us = _init_market(US_SEEDS,   US_STOCKS,   {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})
 
 # ── Broadcast SSE ─────────────────────────────────────────────────────────────
 subscribers = []
@@ -530,11 +539,10 @@ def simulate_tick_stock(stock_id, cur, currency):
     p = cur.get("price", 100)
     tick_size = p * random.uniform(0.0002, 0.0015)
     d = 1 if random.random() > 0.47 else -1
-    dec = 2
-    np_ = round(p + d * tick_size, dec)
-    all_markets = {**market_eu, **market_as, **market_us}
-    seed_price = all_markets.get(stock_id, {}).get("price", p)
-    ch = round((np_ - seed_price) / (seed_price + 1e-9) * 100, 4)
+    np_ = round(p + d * tick_size, 2)
+    # Accumulate change from the session open price (stored as "open")
+    open_price = cur.get("open", p)
+    ch = round((np_ - open_price) / (open_price + 1e-9) * 100, 4)
     return np_, ch
 
 def price_poll_thread():
@@ -993,8 +1001,7 @@ def analyze():
         _yf = stock_info.get("yf") or stock_id
         df = fetch_ohlcv_stock(_yf)
         indicators = None
-        if "data_src" not in dir():
-            data_src = "approximation"
+        data_src = "approximation"
         if df is not None and len(df) >= 20:
             try:
                 indicators = compute_indicators(df)

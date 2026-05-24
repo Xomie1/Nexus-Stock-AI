@@ -70,6 +70,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     renderPredSidebar();
     renderJournal();
     startSSE();
+
+    // Auto-scan: run 2s after load, then every 5 minutes
+    setTimeout(() => runScan(true), 2000);
+    setInterval(() => runScan(true), 5 * 60 * 1000);
   } catch(e) {
     console.error("Init failed:", e);
     document.getElementById("kpi-grid").innerHTML =
@@ -814,41 +818,59 @@ function setScanMarket(mkt, btn) {
   if (btn) btn.classList.add("active");
 }
 
-async function runScan() {
+async function runScan(silent = false) {
   const btn = document.getElementById("scan-btn");
-  btn.disabled = true; btn.textContent = "SCANNING...";
-  document.getElementById("scanner-content").innerHTML =
-    `<div class="loading"><div class="spin"></div> SCANNING ALL STOCKS...</div>`;
-
+  btn.disabled = true;
+  if (!silent) {
+    btn.textContent = "SCANNING...";
+    document.getElementById("scanner-content").innerHTML =
+      `<div class="loading"><div class="spin"></div> SCANNING ALL STOCKS...</div>`;
+  }
   try {
     const res  = await fetch("/api/scan", {
       method: "POST", headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ market: scanMarket })
+      body: JSON.stringify({ market: silent ? "both" : scanMarket })
     });
     const data = await res.json();
-    renderScanResults(data);
+    renderScanResults(data, silent);
   } catch(e) {
-    document.getElementById("scanner-content").innerHTML =
+    if (!silent) document.getElementById("scanner-content").innerHTML =
       `<div style="color:var(--red);font-family:var(--font-mono);font-size:10px;padding:20px">ERROR: ${e.message}</div>`;
   }
   btn.disabled = false; btn.textContent = "⚡ RUN SCAN";
 }
 
-function renderScanResults(data) {
+function renderScanResults(data, silent = false) {
   const results = data.results || [];
+
+  // Update scan nav badge always
+  const scanNav = document.querySelector('.nav-item[data-page="scanner"]');
+  if (scanNav && results.length) {
+    const bulls = results.filter(r=>r.direction==="BULLISH").length;
+    const bears = results.filter(r=>r.direction==="BEARISH").length;
+    scanNav.querySelector("span:last-child").innerHTML =
+      `SCAN <span style="font-size:7px;color:var(--green)">${bulls}▲</span><span style="font-size:7px;color:var(--red)">${bears}▼</span>`;
+  }
+
+  // Only update scanner page content if not silent (auto-scan doesn't overwrite what user sees)
+  if (silent && currentPage !== "scanner") return;
+
   if (!results.length) {
     document.getElementById("scanner-content").innerHTML =
-      `<div class="empty-state"><div class="empty-title">NO SIGNALS</div><div class="empty-sub">NO HIGH-CONFIDENCE SETUPS FOUND</div></div>`;
+      `<div class="empty-state"><div class="empty-title">NO SIGNALS</div><div class="empty-sub">NO HIGH-CONFIDENCE SETUPS FOUND RIGHT NOW</div></div>`;
     return;
   }
   const bulls = results.filter(r=>r.direction==="BULLISH");
   const bears = results.filter(r=>r.direction==="BEARISH");
+  const lastScan = new Date().toUTCString().slice(17,25);
 
   document.getElementById("scanner-content").innerHTML = `
-    <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:16px">
-      FOUND ${results.length} SIGNALS · 
-      <span style="color:var(--green)">${bulls.length} BULLISH</span> · 
-      <span style="color:var(--red)">${bears.length} BEARISH</span>
+    <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center">
+      <span>FOUND ${results.length} SIGNALS ·
+      <span style="color:var(--green)">${bulls.length} BULLISH</span> ·
+      <span style="color:var(--red)">${bears.length} BEARISH</span></span>
+      <span style="font-size:8px;color:var(--text4)">AUTO-UPDATED ${lastScan} UTC · refreshes every 5 min</span>
+    </div>
     </div>
     <div class="scanner-grid">
       ${results.map(r => {
