@@ -34,6 +34,29 @@ from flask_cors import CORS
 import numpy as np
 import pandas as pd
 
+# ── Load .env file if present (must be before any os.environ.get calls) ───────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv optional — env vars still work via OS / Render dashboard
+
+# ── Persistent storage (Supabase) ─────────────────────────────────────────────
+try:
+    from database import (
+        save_ngx_prices   as _db_save,
+        load_all_ngx_history as _db_load_history,
+        get_data_summary  as _db_summary,
+        is_connected      as _db_connected,
+    )
+    _db_ok = True
+except ImportError:
+    _db_ok = False
+    def _db_save(prices):         return False
+    def _db_load_history(days=200): return {}
+    def _db_summary():            return {"connected": False, "message": "database.py not found"}
+    def _db_connected():          return False
+
 # ── Local retrieval model ─────────────────────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "model"))
 try:
@@ -216,26 +239,91 @@ except Exception as _e:
     _NG_SEEDS_FULL = {}
 
 US_STOCKS = [
-    {"id":"AAPL",  "name":"Apple Inc",           "sector":"Technology","currency":"USD","yf":"AAPL",  "color":"#4A9EFF"},
-    {"id":"MSFT",  "name":"Microsoft Corp",       "sector":"Technology","currency":"USD","yf":"MSFT",  "color":"#00D4AA"},
-    {"id":"NVDA",  "name":"NVIDIA Corp",           "sector":"Technology","currency":"USD","yf":"NVDA",  "color":"#76C442"},
-    {"id":"GOOGL", "name":"Alphabet Inc",          "sector":"Technology","currency":"USD","yf":"GOOGL", "color":"#FF6B4A"},
-    {"id":"AMZN",  "name":"Amazon.com Inc",        "sector":"Consumer",  "currency":"USD","yf":"AMZN",  "color":"#FFB84A"},
-    {"id":"META",  "name":"Meta Platforms",        "sector":"Technology","currency":"USD","yf":"META",  "color":"#4267B2"},
-    {"id":"TSLA",  "name":"Tesla Inc",             "sector":"EV/Auto",   "currency":"USD","yf":"TSLA",  "color":"#CC0000"},
-    {"id":"BRK-B", "name":"Berkshire Hathaway B",  "sector":"Finance",   "currency":"USD","yf":"BRK-B", "color":"#C084FC"},
-    {"id":"JPM",   "name":"JPMorgan Chase",        "sector":"Finance",   "currency":"USD","yf":"JPM",   "color":"#38BDF8"},
-    {"id":"V",     "name":"Visa Inc",              "sector":"Finance",   "currency":"USD","yf":"V",     "color":"#1A56DB"},
-    {"id":"JNJ",   "name":"Johnson & Johnson",     "sector":"Healthcare","currency":"USD","yf":"JNJ",   "color":"#E63946"},
-    {"id":"XOM",   "name":"Exxon Mobil",           "sector":"Energy",    "currency":"USD","yf":"XOM",   "color":"#34D399"},
-    {"id":"WMT",   "name":"Walmart Inc",           "sector":"Consumer",  "currency":"USD","yf":"WMT",   "color":"#FCD34D"},
-    {"id":"SPY",   "name":"S&P 500 ETF",           "sector":"ETF",       "currency":"USD","yf":"SPY",   "color":"#FB923C"},
-    {"id":"QQQ",   "name":"Nasdaq 100 ETF",        "sector":"ETF",       "currency":"USD","yf":"QQQ",   "color":"#F472B6"},
-    {"id":"GLD",   "name":"Gold ETF",              "sector":"ETF",       "currency":"USD","yf":"GLD",   "color":"#FFD700"},
-    {"id":"NFLX",  "name":"Netflix Inc",           "sector":"Media",     "currency":"USD","yf":"NFLX",  "color":"#E50914"},
-    {"id":"DIS",   "name":"Walt Disney Co",        "sector":"Media",     "currency":"USD","yf":"DIS",   "color":"#0072CE"},
-    {"id":"BAC",   "name":"Bank of America",       "sector":"Finance",   "currency":"USD","yf":"BAC",   "color":"#E31837"},
-    {"id":"COIN",  "name":"Coinbase Global",       "sector":"Crypto/Finance","currency":"USD","yf":"COIN","color":"#1652F0"},
+    # ── Mega-cap Technology ───────────────────────────────────────────────────
+    {"id":"AAPL",  "name":"Apple Inc",             "sector":"Technology",    "currency":"USD","yf":"AAPL",  "color":"#4A9EFF"},
+    {"id":"MSFT",  "name":"Microsoft Corp",         "sector":"Technology",    "currency":"USD","yf":"MSFT",  "color":"#00D4AA"},
+    {"id":"NVDA",  "name":"NVIDIA Corp",             "sector":"Technology",    "currency":"USD","yf":"NVDA",  "color":"#76C442"},
+    {"id":"GOOGL", "name":"Alphabet Inc",            "sector":"Technology",    "currency":"USD","yf":"GOOGL", "color":"#FF6B4A"},
+    {"id":"META",  "name":"Meta Platforms",          "sector":"Technology",    "currency":"USD","yf":"META",  "color":"#4267B2"},
+    # ── Technology ────────────────────────────────────────────────────────────
+    {"id":"AMD",   "name":"Advanced Micro Devices",  "sector":"Technology",    "currency":"USD","yf":"AMD",   "color":"#ED1C24"},
+    {"id":"INTC",  "name":"Intel Corp",              "sector":"Technology",    "currency":"USD","yf":"INTC",  "color":"#0071C5"},
+    {"id":"AVGO",  "name":"Broadcom Inc",            "sector":"Technology",    "currency":"USD","yf":"AVGO",  "color":"#CF0A2C"},
+    {"id":"QCOM",  "name":"Qualcomm Inc",            "sector":"Technology",    "currency":"USD","yf":"QCOM",  "color":"#3253DC"},
+    {"id":"CRM",   "name":"Salesforce Inc",          "sector":"Technology",    "currency":"USD","yf":"CRM",   "color":"#00A1E0"},
+    {"id":"ORCL",  "name":"Oracle Corp",             "sector":"Technology",    "currency":"USD","yf":"ORCL",  "color":"#F80000"},
+    {"id":"ADBE",  "name":"Adobe Inc",               "sector":"Technology",    "currency":"USD","yf":"ADBE",  "color":"#FF0000"},
+    {"id":"IBM",   "name":"IBM Corp",                "sector":"Technology",    "currency":"USD","yf":"IBM",   "color":"#1F70C1"},
+    {"id":"UBER",  "name":"Uber Technologies",       "sector":"Technology",    "currency":"USD","yf":"UBER",  "color":"#000000"},
+    {"id":"PLTR",  "name":"Palantir Technologies",   "sector":"Technology",    "currency":"USD","yf":"PLTR",  "color":"#8B5CF6"},
+    {"id":"SNOW",  "name":"Snowflake Inc",           "sector":"Technology",    "currency":"USD","yf":"SNOW",  "color":"#29B5E8"},
+    {"id":"NFLX",  "name":"Netflix Inc",             "sector":"Media",         "currency":"USD","yf":"NFLX",  "color":"#E50914"},
+    # ── Consumer (Discretionary & Staples) ───────────────────────────────────
+    {"id":"AMZN",  "name":"Amazon.com Inc",          "sector":"Consumer",      "currency":"USD","yf":"AMZN",  "color":"#FFB84A"},
+    {"id":"TSLA",  "name":"Tesla Inc",               "sector":"EV/Auto",       "currency":"USD","yf":"TSLA",  "color":"#CC0000"},
+    {"id":"WMT",   "name":"Walmart Inc",             "sector":"Consumer",      "currency":"USD","yf":"WMT",   "color":"#FCD34D"},
+    {"id":"DIS",   "name":"Walt Disney Co",          "sector":"Media",         "currency":"USD","yf":"DIS",   "color":"#0072CE"},
+    {"id":"NKE",   "name":"Nike Inc",                "sector":"Consumer",      "currency":"USD","yf":"NKE",   "color":"#F05A28"},
+    {"id":"MCD",   "name":"McDonald's Corp",         "sector":"Consumer",      "currency":"USD","yf":"MCD",   "color":"#FFC72C"},
+    {"id":"SBUX",  "name":"Starbucks Corp",          "sector":"Consumer",      "currency":"USD","yf":"SBUX",  "color":"#00704A"},
+    {"id":"HD",    "name":"Home Depot Inc",          "sector":"Consumer",      "currency":"USD","yf":"HD",    "color":"#F96302"},
+    {"id":"COST",  "name":"Costco Wholesale",        "sector":"Consumer",      "currency":"USD","yf":"COST",  "color":"#005DAA"},
+    {"id":"CMG",   "name":"Chipotle Mexican Grill",  "sector":"Consumer",      "currency":"USD","yf":"CMG",   "color":"#A81612"},
+    {"id":"GM",    "name":"General Motors Co",       "sector":"EV/Auto",       "currency":"USD","yf":"GM",    "color":"#0170CE"},
+    {"id":"F",     "name":"Ford Motor Co",           "sector":"EV/Auto",       "currency":"USD","yf":"F",     "color":"#003478"},
+    # ── Finance ───────────────────────────────────────────────────────────────
+    {"id":"BRK-B", "name":"Berkshire Hathaway B",    "sector":"Finance",       "currency":"USD","yf":"BRK-B", "color":"#C084FC"},
+    {"id":"JPM",   "name":"JPMorgan Chase",          "sector":"Finance",       "currency":"USD","yf":"JPM",   "color":"#38BDF8"},
+    {"id":"V",     "name":"Visa Inc",                "sector":"Finance",       "currency":"USD","yf":"V",     "color":"#1A56DB"},
+    {"id":"MA",    "name":"Mastercard Inc",          "sector":"Finance",       "currency":"USD","yf":"MA",    "color":"#EB001B"},
+    {"id":"BAC",   "name":"Bank of America",         "sector":"Finance",       "currency":"USD","yf":"BAC",   "color":"#E31837"},
+    {"id":"GS",    "name":"Goldman Sachs Group",     "sector":"Finance",       "currency":"USD","yf":"GS",    "color":"#7399C6"},
+    {"id":"MS",    "name":"Morgan Stanley",          "sector":"Finance",       "currency":"USD","yf":"MS",    "color":"#215091"},
+    {"id":"WFC",   "name":"Wells Fargo & Co",        "sector":"Finance",       "currency":"USD","yf":"WFC",   "color":"#D71E28"},
+    {"id":"C",     "name":"Citigroup Inc",           "sector":"Finance",       "currency":"USD","yf":"C",     "color":"#003B70"},
+    {"id":"AXP",   "name":"American Express Co",     "sector":"Finance",       "currency":"USD","yf":"AXP",   "color":"#007BC1"},
+    {"id":"PYPL",  "name":"PayPal Holdings",         "sector":"Finance",       "currency":"USD","yf":"PYPL",  "color":"#003087"},
+    {"id":"SCHW",  "name":"Charles Schwab Corp",     "sector":"Finance",       "currency":"USD","yf":"SCHW",  "color":"#00A0DF"},
+    {"id":"COIN",  "name":"Coinbase Global",         "sector":"Crypto/Finance","currency":"USD","yf":"COIN",  "color":"#1652F0"},
+    # ── Healthcare ────────────────────────────────────────────────────────────
+    {"id":"JNJ",   "name":"Johnson & Johnson",       "sector":"Healthcare",    "currency":"USD","yf":"JNJ",   "color":"#E63946"},
+    {"id":"UNH",   "name":"UnitedHealth Group",      "sector":"Healthcare",    "currency":"USD","yf":"UNH",   "color":"#005EB8"},
+    {"id":"LLY",   "name":"Eli Lilly & Co",          "sector":"Healthcare",    "currency":"USD","yf":"LLY",   "color":"#E11B22"},
+    {"id":"ABBV",  "name":"AbbVie Inc",              "sector":"Healthcare",    "currency":"USD","yf":"ABBV",  "color":"#071D49"},
+    {"id":"MRK",   "name":"Merck & Co",              "sector":"Healthcare",    "currency":"USD","yf":"MRK",   "color":"#00857C"},
+    {"id":"PFE",   "name":"Pfizer Inc",              "sector":"Healthcare",    "currency":"USD","yf":"PFE",   "color":"#0074C8"},
+    {"id":"TMO",   "name":"Thermo Fisher Scientific","sector":"Healthcare",    "currency":"USD","yf":"TMO",   "color":"#005C8E"},
+    {"id":"ABT",   "name":"Abbott Laboratories",     "sector":"Healthcare",    "currency":"USD","yf":"ABT",   "color":"#007AC2"},
+    {"id":"AMGN",  "name":"Amgen Inc",               "sector":"Healthcare",    "currency":"USD","yf":"AMGN",  "color":"#00579B"},
+    {"id":"ISRG",  "name":"Intuitive Surgical",      "sector":"Healthcare",    "currency":"USD","yf":"ISRG",  "color":"#00A99D"},
+    # ── Energy ────────────────────────────────────────────────────────────────
+    {"id":"XOM",   "name":"Exxon Mobil",             "sector":"Energy",        "currency":"USD","yf":"XOM",   "color":"#34D399"},
+    {"id":"CVX",   "name":"Chevron Corp",            "sector":"Energy",        "currency":"USD","yf":"CVX",   "color":"#009BDE"},
+    {"id":"COP",   "name":"ConocoPhillips",          "sector":"Energy",        "currency":"USD","yf":"COP",   "color":"#E31837"},
+    {"id":"SLB",   "name":"SLB (Schlumberger)",      "sector":"Energy",        "currency":"USD","yf":"SLB",   "color":"#00A3E0"},
+    {"id":"OXY",   "name":"Occidental Petroleum",    "sector":"Energy",        "currency":"USD","yf":"OXY",   "color":"#B31F2B"},
+    # ── Industrials ──────────────────────────────────────────────────────────
+    {"id":"CAT",   "name":"Caterpillar Inc",         "sector":"Industrial",    "currency":"USD","yf":"CAT",   "color":"#FFCD11"},
+    {"id":"BA",    "name":"Boeing Co",               "sector":"Industrial",    "currency":"USD","yf":"BA",    "color":"#1D428A"},
+    {"id":"GE",    "name":"GE Aerospace",            "sector":"Industrial",    "currency":"USD","yf":"GE",    "color":"#003057"},
+    {"id":"HON",   "name":"Honeywell International", "sector":"Industrial",    "currency":"USD","yf":"HON",   "color":"#E1001A"},
+    {"id":"UPS",   "name":"United Parcel Service",   "sector":"Industrial",    "currency":"USD","yf":"UPS",   "color":"#4B1C12"},
+    {"id":"RTX",   "name":"RTX Corp (Raytheon)",     "sector":"Industrial",    "currency":"USD","yf":"RTX",   "color":"#005EB8"},
+    {"id":"LMT",   "name":"Lockheed Martin Corp",    "sector":"Industrial",    "currency":"USD","yf":"LMT",   "color":"#003B70"},
+    # ── Materials ─────────────────────────────────────────────────────────────
+    {"id":"LIN",   "name":"Linde PLC",               "sector":"Materials",     "currency":"USD","yf":"LIN",   "color":"#009BDE"},
+    {"id":"NEM",   "name":"Newmont Corp (Gold)",      "sector":"Materials",     "currency":"USD","yf":"NEM",   "color":"#FFD700"},
+    {"id":"FCX",   "name":"Freeport-McMoRan (Copper)","sector":"Materials",    "currency":"USD","yf":"FCX",   "color":"#B87333"},
+    # ── ETFs ──────────────────────────────────────────────────────────────────
+    {"id":"SPY",   "name":"S&P 500 ETF (SPDR)",      "sector":"ETF",           "currency":"USD","yf":"SPY",   "color":"#FB923C"},
+    {"id":"QQQ",   "name":"Nasdaq 100 ETF",          "sector":"ETF",           "currency":"USD","yf":"QQQ",   "color":"#F472B6"},
+    {"id":"IWM",   "name":"Russell 2000 ETF",        "sector":"ETF",           "currency":"USD","yf":"IWM",   "color":"#A78BFA"},
+    {"id":"DIA",   "name":"Dow Jones ETF (SPDR)",    "sector":"ETF",           "currency":"USD","yf":"DIA",   "color":"#60A5FA"},
+    {"id":"GLD",   "name":"Gold ETF (SPDR)",         "sector":"ETF",           "currency":"USD","yf":"GLD",   "color":"#FFD700"},
+    {"id":"TLT",   "name":"20+ Year Treasury Bond ETF","sector":"ETF",         "currency":"USD","yf":"TLT",   "color":"#6EE7B7"},
+    {"id":"XLF",   "name":"Financial Sector ETF",    "sector":"ETF",           "currency":"USD","yf":"XLF",   "color":"#93C5FD"},
+    {"id":"XLE",   "name":"Energy Sector ETF",       "sector":"ETF",           "currency":"USD","yf":"XLE",   "color":"#6EE7B7"},
+    {"id":"XLK",   "name":"Technology Sector ETF",   "sector":"ETF",           "currency":"USD","yf":"XLK",   "color":"#A5F3FC"},
 ]
 
 ALL_STOCKS = NIGERIAN_STOCKS + US_STOCKS
@@ -249,26 +337,90 @@ NG_SEEDS = _NG_SEEDS_FULL if _NG_SEEDS_FULL else {
     for sid, name, sector, price, vol in _NGX_FULL
 }
 US_SEEDS = {
-    "AAPL":  {"price":226.5, "change":0.84, "high":228.2,"low":224.8,"vol":52000000,"mktcap":"3.42T"},
-    "MSFT":  {"price":415.3, "change":0.62, "high":417.1,"low":413.5,"vol":18000000,"mktcap":"3.08T"},
-    "NVDA":  {"price":875.2, "change":2.31, "high":882.0,"low":868.5,"vol":42000000,"mktcap":"2.16T"},
-    "GOOGL": {"price":172.8, "change":0.55, "high":174.2,"low":171.3,"vol":21000000,"mktcap":"2.14T"},
-    "AMZN":  {"price":198.4, "change":1.12, "high":200.1,"low":196.8,"vol":35000000,"mktcap":"2.09T"},
-    "META":  {"price":528.7, "change":1.44, "high":532.0,"low":525.1,"vol":15000000,"mktcap":"1.35T"},
-    "TSLA":  {"price":182.3, "change":-1.82,"high":186.5,"low":181.0,"vol":88000000,"mktcap":"581B"},
-    "BRK-B": {"price":412.6, "change":0.28, "high":413.8,"low":411.2,"vol":3400000, "mktcap":"905B"},
-    "JPM":   {"price":218.4, "change":0.61, "high":219.6,"low":217.1,"vol":9200000, "mktcap":"628B"},
-    "V":     {"price":278.9, "change":0.43, "high":280.1,"low":277.5,"vol":7100000, "mktcap":"580B"},
-    "JNJ":   {"price":155.2, "change":-0.19,"high":156.0,"low":154.5,"vol":8800000, "mktcap":"372B"},
-    "XOM":   {"price":116.7, "change":0.77, "high":117.5,"low":115.8,"vol":16000000,"mktcap":"470B"},
-    "WMT":   {"price":92.3,  "change":0.33, "high":92.9, "low":91.7, "vol":14000000,"mktcap":"248B"},
-    "SPY":   {"price":524.1, "change":0.51, "high":525.8,"low":522.4,"vol":65000000,"mktcap":"480B"},
-    "QQQ":   {"price":445.2, "change":0.72, "high":447.0,"low":443.5,"vol":38000000,"mktcap":"220B"},
-    "GLD":   {"price":232.5, "change":0.38, "high":233.4,"low":231.6,"vol":9800000, "mktcap":"85B"},
-    "NFLX":  {"price":635.4, "change":1.27, "high":639.1,"low":631.8,"vol":5200000, "mktcap":"278B"},
-    "DIS":   {"price":110.3, "change":-0.45,"high":111.2,"low":109.5,"vol":12000000,"mktcap":"201B"},
-    "BAC":   {"price":44.2,  "change":0.68, "high":44.6, "low":43.8, "vol":41000000,"mktcap":"338B"},
-    "COIN":  {"price":225.8, "change":3.41, "high":229.5,"low":218.3,"vol":14000000,"mktcap":"56B"},
+    # Technology
+    "AAPL":  {"price":198.5, "change":0.84, "high":200.1,"low":197.0,"vol":52000000, "mktcap":"3.02T"},
+    "MSFT":  {"price":452.3, "change":0.62, "high":454.1,"low":450.5,"vol":18000000, "mktcap":"3.36T"},
+    "NVDA":  {"price":135.2, "change":2.31, "high":137.0,"low":133.5,"vol":42000000, "mktcap":"3.31T"},
+    "GOOGL": {"price":175.8, "change":0.55, "high":177.2,"low":174.3,"vol":21000000, "mktcap":"2.17T"},
+    "META":  {"price":605.7, "change":1.44, "high":609.0,"low":602.1,"vol":15000000, "mktcap":"1.54T"},
+    "AMD":   {"price":108.4, "change":1.21, "high":110.0,"low":107.0,"vol":35000000, "mktcap":"176B"},
+    "INTC":  {"price":21.3,  "change":-0.85,"high":21.8, "low":21.0, "vol":50000000, "mktcap":"91B"},
+    "AVGO":  {"price":233.5, "change":0.92, "high":235.0,"low":232.0,"vol":8000000,  "mktcap":"1.09T"},
+    "QCOM":  {"price":155.2, "change":0.43, "high":156.5,"low":154.0,"vol":9000000,  "mktcap":"172B"},
+    "CRM":   {"price":272.8, "change":0.65, "high":274.5,"low":271.0,"vol":5000000,  "mktcap":"263B"},
+    "ORCL":  {"price":168.3, "change":0.82, "high":169.8,"low":167.0,"vol":6000000,  "mktcap":"462B"},
+    "ADBE":  {"price":368.5, "change":0.55, "high":370.5,"low":367.0,"vol":3000000,  "mktcap":"162B"},
+    "IBM":   {"price":238.4, "change":0.31, "high":239.5,"low":237.5,"vol":4000000,  "mktcap":"218B"},
+    "UBER":  {"price":72.5,  "change":1.15, "high":73.2, "low":71.8, "vol":18000000, "mktcap":"152B"},
+    "PLTR":  {"price":125.8, "change":2.30, "high":127.5,"low":124.0,"vol":55000000, "mktcap":"272B"},
+    "SNOW":  {"price":171.2, "change":1.05, "high":172.8,"low":170.0,"vol":4000000,  "mktcap":"57B"},
+    "NFLX":  {"price":1148.4,"change":1.27, "high":1155.0,"low":1142.0,"vol":5200000,"mktcap":"488B"},
+    # Consumer
+    "AMZN":  {"price":200.4, "change":1.12, "high":202.1,"low":198.8,"vol":35000000, "mktcap":"2.14T"},
+    "TSLA":  {"price":339.3, "change":-1.82,"high":345.5,"low":337.0,"vol":88000000, "mktcap":"1.09T"},
+    "WMT":   {"price":97.3,  "change":0.33, "high":97.9, "low":96.7, "vol":14000000, "mktcap":"262B"},
+    "DIS":   {"price":99.3,  "change":-0.45,"high":100.2,"low":98.5, "vol":12000000, "mktcap":"181B"},
+    "NKE":   {"price":62.4,  "change":-0.31,"high":63.0, "low":61.8, "vol":9000000,  "mktcap":"93B"},
+    "MCD":   {"price":310.5, "change":0.45, "high":312.0,"low":309.0,"vol":3000000,  "mktcap":"222B"},
+    "SBUX":  {"price":87.2,  "change":-0.22,"high":88.0, "low":86.5, "vol":7000000,  "mktcap":"97B"},
+    "HD":    {"price":395.8, "change":0.67, "high":397.5,"low":394.0,"vol":4000000,  "mktcap":"389B"},
+    "COST":  {"price":1018.5,"change":0.88, "high":1023.0,"low":1015.0,"vol":1800000,"mktcap":"452B"},
+    "CMG":   {"price":51.4,  "change":0.55, "high":52.0, "low":51.0, "vol":2500000,  "mktcap":"143B"},
+    "GM":    {"price":52.3,  "change":0.82, "high":52.8, "low":51.8, "vol":14000000, "mktcap":"45B"},
+    "F":     {"price":11.2,  "change":-0.45,"high":11.5, "low":11.0, "vol":40000000, "mktcap":"43B"},
+    # Finance
+    "BRK-B": {"price":548.6, "change":0.28, "high":550.0,"low":547.0,"vol":3400000,  "mktcap":"1.21T"},
+    "JPM":   {"price":271.4, "change":0.61, "high":272.6,"low":270.1,"vol":9200000,  "mktcap":"775B"},
+    "V":     {"price":368.9, "change":0.43, "high":370.1,"low":367.5,"vol":7100000,  "mktcap":"756B"},
+    "MA":    {"price":556.8, "change":0.55, "high":558.5,"low":555.0,"vol":2500000,  "mktcap":"501B"},
+    "BAC":   {"price":46.2,  "change":0.68, "high":46.6, "low":45.8, "vol":41000000, "mktcap":"354B"},
+    "GS":    {"price":617.5, "change":0.82, "high":619.5,"low":615.5,"vol":2000000,  "mktcap":"199B"},
+    "MS":    {"price":128.4, "change":0.55, "high":129.5,"low":127.5,"vol":8000000,  "mktcap":"211B"},
+    "WFC":   {"price":76.3,  "change":0.43, "high":76.8, "low":75.8, "vol":14000000, "mktcap":"256B"},
+    "C":     {"price":76.5,  "change":0.61, "high":77.0, "low":76.0, "vol":16000000, "mktcap":"143B"},
+    "AXP":   {"price":302.8, "change":0.44, "high":304.0,"low":301.5,"vol":3500000,  "mktcap":"211B"},
+    "PYPL":  {"price":72.5,  "change":-0.32,"high":73.0, "low":72.0, "vol":10000000, "mktcap":"72B"},
+    "SCHW":  {"price":77.8,  "change":0.52, "high":78.3, "low":77.3, "vol":8000000,  "mktcap":"138B"},
+    "COIN":  {"price":235.8, "change":3.41, "high":239.5,"low":228.3,"vol":14000000, "mktcap":"59B"},
+    # Healthcare
+    "JNJ":   {"price":154.2, "change":-0.19,"high":155.0,"low":153.5,"vol":8800000,  "mktcap":"369B"},
+    "UNH":   {"price":288.5, "change":0.72, "high":290.0,"low":287.0,"vol":5000000,  "mktcap":"265B"},
+    "LLY":   {"price":745.2, "change":1.12, "high":749.0,"low":742.0,"vol":4000000,  "mktcap":"709B"},
+    "ABBV":  {"price":201.3, "change":0.45, "high":202.5,"low":200.0,"vol":5500000,  "mktcap":"355B"},
+    "MRK":   {"price":82.5,  "change":-0.25,"high":83.0, "low":82.0, "vol":9000000,  "mktcap":"208B"},
+    "PFE":   {"price":26.8,  "change":-0.45,"high":27.2, "low":26.5, "vol":30000000, "mktcap":"151B"},
+    "TMO":   {"price":455.8, "change":0.62, "high":457.5,"low":454.0,"vol":2500000,  "mktcap":"173B"},
+    "ABT":   {"price":128.5, "change":0.38, "high":129.5,"low":127.5,"vol":5000000,  "mktcap":"222B"},
+    "AMGN":  {"price":282.5, "change":0.42, "high":284.0,"low":281.0,"vol":3500000,  "mktcap":"149B"},
+    "ISRG":  {"price":552.8, "change":0.85, "high":555.0,"low":550.5,"vol":1200000,  "mktcap":"195B"},
+    # Energy
+    "XOM":   {"price":110.7, "change":0.77, "high":111.5,"low":109.8,"vol":16000000, "mktcap":"446B"},
+    "CVX":   {"price":155.3, "change":0.55, "high":156.0,"low":154.5,"vol":10000000, "mktcap":"288B"},
+    "COP":   {"price":94.5,  "change":0.42, "high":95.2, "low":93.8, "vol":8000000,  "mktcap":"120B"},
+    "SLB":   {"price":40.2,  "change":0.35, "high":40.8, "low":39.8, "vol":12000000, "mktcap":"57B"},
+    "OXY":   {"price":44.8,  "change":0.62, "high":45.2, "low":44.4, "vol":9000000,  "mktcap":"41B"},
+    # Industrial
+    "CAT":   {"price":358.5, "change":0.72, "high":360.5,"low":357.0,"vol":3000000,  "mktcap":"172B"},
+    "BA":    {"price":175.8, "change":-0.85,"high":177.0,"low":174.5,"vol":8000000,  "mktcap":"133B"},
+    "GE":    {"price":208.5, "change":0.62, "high":209.8,"low":207.5,"vol":5500000,  "mktcap":"226B"},
+    "HON":   {"price":224.8, "change":0.35, "high":225.8,"low":223.8,"vol":3000000,  "mktcap":"143B"},
+    "UPS":   {"price":101.5, "change":-0.22,"high":102.0,"low":101.0,"vol":4000000,  "mktcap":"87B"},
+    "RTX":   {"price":128.5, "change":0.45, "high":129.0,"low":128.0,"vol":6000000,  "mktcap":"172B"},
+    "LMT":   {"price":468.5, "change":0.35, "high":470.0,"low":467.0,"vol":1500000,  "mktcap":"108B"},
+    # Materials
+    "LIN":   {"price":488.5, "change":0.42, "high":490.0,"low":487.0,"vol":1500000,  "mktcap":"234B"},
+    "NEM":   {"price":55.2,  "change":0.88, "high":55.8, "low":54.7, "vol":12000000, "mktcap":"43B"},
+    "FCX":   {"price":41.5,  "change":1.12, "high":42.0, "low":41.0, "vol":18000000, "mktcap":"59B"},
+    # ETFs
+    "SPY":   {"price":592.1, "change":0.51, "high":593.8,"low":590.4,"vol":65000000, "mktcap":"590B"},
+    "QQQ":   {"price":522.2, "change":0.72, "high":524.0,"low":520.5,"vol":38000000, "mktcap":"312B"},
+    "IWM":   {"price":205.8, "change":0.45, "high":206.5,"low":205.0,"vol":25000000, "mktcap":"62B"},
+    "DIA":   {"price":432.5, "change":0.38, "high":433.5,"low":431.5,"vol":5000000,  "mktcap":"34B"},
+    "GLD":   {"price":306.5, "change":0.55, "high":307.4,"low":305.6,"vol":9800000,  "mktcap":"108B"},
+    "TLT":   {"price":85.2,  "change":-0.22,"high":85.8, "low":84.8, "vol":25000000, "mktcap":"58B"},
+    "XLF":   {"price":51.5,  "change":0.35, "high":51.8, "low":51.2, "vol":30000000, "mktcap":"46B"},
+    "XLE":   {"price":88.5,  "change":0.42, "high":89.0, "low":88.0, "vol":15000000, "mktcap":"36B"},
+    "XLK":   {"price":242.5, "change":0.68, "high":243.5,"low":241.5,"vol":8000000,  "mktcap":"68B"},
 }
 
 # Rolling price history for NGX stocks — stores up to 200 daily closes
@@ -279,7 +431,10 @@ _ngx_price_history = collections.defaultdict(list)  # {ticker: [{"date":str,"clo
 _NGX_HISTORY_MAX = 200  # keep 200 days
 
 def _record_ngx_prices(prices: dict):
-    """Called after each doclib fetch — appends today's price to history."""
+    """
+    Called after each scraper poll — appends today's price to in-memory history
+    AND saves to Supabase for persistent accumulation across server restarts.
+    """
     import datetime
     today = datetime.date.today().isoformat()
     for ticker, data in prices.items():
@@ -295,6 +450,10 @@ def _record_ngx_prices(prices: dict):
             hist.append({"date": today, "close": p, "vol": v})
         if len(hist) > _NGX_HISTORY_MAX:
             _ngx_price_history[ticker] = hist[-_NGX_HISTORY_MAX:]
+    # Persist to Supabase in a daemon thread (non-blocking, fire-and-forget)
+    if _db_ok:
+        threading.Thread(target=_db_save, args=(prices,), daemon=True,
+                         name="db-save").start()
 
 def _bootstrap_ngx_history(prices: dict):
     """
@@ -360,13 +519,34 @@ def _build_ngx_df(ticker: str):
     return df
 
 def _fetch_live_ng_seeds():
-    """Fetch current NGX prices at startup via the scraper to replace stale hardcoded seeds."""
+    """
+    Fetch current NGX prices at startup. Priority order:
+      1. Supabase persistent storage (real accumulated history)
+      2. Live scraper prices (to update today's close + bootstrap synthetic history)
+    """
+    # ── Step 1: Load real history from Supabase ───────────────────────────────
+    if _db_ok:
+        try:
+            supabase_hist = _db_load_history(days=200)
+            if supabase_hist:
+                real_count = 0
+                for ticker, hist in supabase_hist.items():
+                    if hist:
+                        _ngx_price_history[ticker] = hist
+                        real_count += 1
+                print(f"[STARTUP] ✅ Loaded REAL price history for {real_count} NGX tickers from Supabase")
+            else:
+                print("[STARTUP] Supabase connected but no NGX history stored yet — will start accumulating")
+        except Exception as e:
+            print(f"[STARTUP] Supabase history load failed ({e})")
+
+    # ── Step 2: Fetch live prices from scraper ────────────────────────────────
     try:
         from ngx_scraper import fetch_ngx_prices
-        print(f"[STARTUP] Fetching live NGX prices...")
+        print(f"[STARTUP] Fetching live NGX prices from scraper...")
         prices = fetch_ngx_prices(force=True)
         if not prices:
-            print("[STARTUP] NGX scraper returned no data, using hardcoded NGX seeds.")
+            print("[STARTUP] NGX scraper returned no data, using hardcoded seeds.")
             return
         # Sanity check — reject if prices look like USD not NGN
         dangcem = prices.get("DANGCEM", {}).get("price", 0)
@@ -384,11 +564,17 @@ def _fetch_live_ng_seeds():
                 if data.get("mktcap") and data["mktcap"] != "N/A":
                     NG_SEEDS[stock_id]["mktcap"] = data["mktcap"]
                 updated += 1
-        _bootstrap_ngx_history(prices)  # generate 120-day synthetic history immediately
-        _record_ngx_prices(prices)       # record today's actual price on top
+        # Only bootstrap synthetic history for tickers that have no real history yet
+        tickers_needing_bootstrap = {
+            sid: data for sid, data in prices.items()
+            if not _ngx_price_history.get(sid)
+        }
+        if tickers_needing_bootstrap:
+            _bootstrap_ngx_history(tickers_needing_bootstrap)
+        _record_ngx_prices(prices)  # record today's actual price + save to Supabase
         print(f"[STARTUP] Live NGX prices loaded for {updated}/{len(NG_SEEDS)} stocks.")
     except Exception as e:
-        print(f"[STARTUP] NGX startup fetch failed ({e}), using hardcoded NGX seeds.")
+        print(f"[STARTUP] NGX startup fetch failed ({e}), using hardcoded seeds.")
 
 def _fetch_live_us_seeds():
     """Fetch current prices from yfinance at startup to replace stale hardcoded seeds."""
@@ -1290,6 +1476,71 @@ def analyze_chart():
         return jsonify({"error": str(e), "success": False}), 500
 
 
+@app.route("/api/db_stats")
+def db_stats():
+    """Return Supabase database statistics and real NGX data accumulation progress."""
+    summary = _db_summary()
+    # Add guidance on what comes next
+    days = summary.get("days_stored", 0)
+    if not summary.get("connected"):
+        summary["next_milestone"] = "Configure Supabase env vars to enable persistence"
+    elif days < 30:
+        summary["next_milestone"] = f"30-day milestone: {30 - days} days to go — first retrain triggers then"
+    elif days < 60:
+        summary["next_milestone"] = f"60-day milestone: {60 - days} days to go — good prediction accuracy"
+    elif days < 90:
+        summary["next_milestone"] = f"90-day milestone: {90 - days} days to go — excellent accuracy"
+    else:
+        summary["next_milestone"] = "Full maturity reached — AI is continuously improving ✅"
+    return jsonify(summary)
+
+
+@app.route("/api/retrain", methods=["POST"])
+def retrain_now():
+    """
+    Manually trigger a model retrain. Runs in background — returns immediately.
+    Requires ≥30 days of real NGX data in Supabase.
+    POST body: {} or {"reason": "manual test"}
+    """
+    try:
+        from retrain_scheduler import run_retrain_background, get_status
+        status = get_status()
+        if status.get("running"):
+            return jsonify({
+                "success": False,
+                "reason": "Retraining already in progress",
+                "status": status,
+            })
+        data   = request.get_json() or {}
+        reason = data.get("reason", "manual_api")
+        run_retrain_background(trigger=reason)
+        return jsonify({
+            "success": True,
+            "message": "Retraining started in background — check /api/training_status for results",
+            "status": get_status(),
+        })
+    except ImportError:
+        return jsonify({"success": False, "reason": "retrain_scheduler not available"}), 503
+    except Exception as e:
+        return jsonify({"success": False, "reason": str(e)}), 500
+
+
+@app.route("/api/training_status")
+def training_status():
+    """Return retraining scheduler state, last results, and AI improvement history."""
+    sched = {}
+    try:
+        from retrain_scheduler import get_status
+        sched = get_status()
+    except ImportError:
+        sched = {"error": "retrain_scheduler not available"}
+    return jsonify(_sanitize({
+        "scheduler":  sched,
+        "database":   _db_summary(),
+        "predictor":  predictor_status(),
+    }))
+
+
 @app.route("/api/scan", methods=["POST"])
 def scan():
     """Quick scan returning rule-based signals for all stocks."""
@@ -1350,15 +1601,27 @@ import signal
 signal.signal(signal.SIGINT,  _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
+# ── Retraining scheduler — start once at module load time ────────────────────
+_scheduler = None
+try:
+    from retrain_scheduler import start_scheduler
+    _scheduler = start_scheduler()
+except ImportError:
+    print("[NEXUS] retrain_scheduler not found — auto-retraining disabled")
+except Exception as _se:
+    print(f"[NEXUS] Scheduler startup error: {_se}")
+
 if __name__ == "__main__":
-    print(f"STOCK NEXUS starting on http://localhost:5002  [{_ASYNC_SERVER} server]")
+    PORT = int(os.environ.get("PORT", 5002))
+    print(f"STOCK NEXUS starting on http://0.0.0.0:{PORT}  [{_ASYNC_SERVER} server]")
+    print(f"[NEXUS] Database: {'Supabase connected ✅' if _db_connected() else 'In-memory only ⚠️  (set SUPABASE_URL + SUPABASE_KEY to persist data)'}")
     print("[NEXUS] Press Ctrl+C to stop.")
     try:
         if _ASYNC_SERVER == "gevent":
             from gevent.pywsgi import WSGIServer
             from gevent import signal as gsignal
             print("[SERVER] gevent WSGIServer — SSE-safe, no kqueue issues")
-            server = WSGIServer(("0.0.0.0", 5002), app)
+            server = WSGIServer(("0.0.0.0", PORT), app)
             gsignal.signal(signal.SIGINT,  _shutdown)
             gsignal.signal(signal.SIGTERM, _shutdown)
             server.serve_forever()
@@ -1366,10 +1629,10 @@ if __name__ == "__main__":
             import eventlet
             import eventlet.wsgi
             print("[SERVER] eventlet WSGIServer — SSE-safe, no kqueue issues")
-            sock = eventlet.listen(("0.0.0.0", 5002))
+            sock = eventlet.listen(("0.0.0.0", PORT))
             eventlet.wsgi.server(sock, app, log_output=False)
         else:
             print("[SERVER] Werkzeug dev server. Install gevent for better SSE support.")
-            app.run(debug=False, port=5002, threaded=True, use_reloader=False)
+            app.run(debug=False, port=PORT, threaded=True, use_reloader=False)
     except (KeyboardInterrupt, SystemExit):
         _shutdown()

@@ -349,10 +349,37 @@ def predictor_status() -> dict:
         with open(_META) as f:
             meta = json.load(f)
     return {
-        "xgboost_ready": bool(_xgb_clf),
-        "lstm_ready":    bool(_lstm_model),
-        "ensemble_ready": bool(_xgb_clf and _lstm_model),
+        "xgboost_ready":     bool(_xgb_clf),
+        "lstm_ready":        bool(_lstm_model),
+        "ensemble_ready":    bool(_xgb_clf and _lstm_model),
         "xgb_direction_acc": meta.get("xgb_direction_acc"),
-        "lstm_direction_acc": meta.get("lstm_direction_acc"),
-        "n_samples": meta.get("n_samples"),
+        "lstm_direction_acc":meta.get("lstm_direction_acc"),
+        "n_samples":         meta.get("n_samples"),
+        "last_retrain":      meta.get("last_retrain"),
+        "real_ngx_days":     meta.get("real_ngx_days", 0),
+        "real_ngx_tickers":  meta.get("real_ngx_tickers", 0),
+        "retrain_trigger":   meta.get("retrain_trigger"),
     }
+
+
+def reload_models() -> bool:
+    """
+    Hot-reload all models from disk without restarting the server.
+    Called automatically after a successful retraining run.
+    Returns True if at least one model loaded successfully.
+    """
+    global _xgb_clf, _xgb_reg, _lstm_model, _scaler, _feat_cols, _seq_len, _loaded
+    print("[PREDICTOR] Reloading models from disk...")
+    # Reset all cached state
+    _xgb_clf    = None
+    _xgb_reg    = None
+    _lstm_model = None
+    _scaler     = None
+    _feat_cols  = None
+    _seq_len    = 30
+    _loaded     = False
+    # Reload
+    _load()
+    ready = models_ready()
+    print(f"[PREDICTOR] Reload {'✅ complete' if ready else '⚠️  no models found'}")
+    return ready

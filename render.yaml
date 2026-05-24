@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: nexus-stock-ai
+    runtime: python
+    # Render will run from the repo root; build & start commands handle the subdirectory
+    buildCommand: pip install -r "stock-nexus-fixed copy/requirements.txt"
+    startCommand: cd "stock-nexus-fixed copy" && python app.py
+    plan: free
+    healthCheckPath: /
+
+    envVars:
+      # Supabase — add your credentials in the Render dashboard
+      # Dashboard → Environment → Add Environment Variable
+      - key: SUPABASE_URL
+        sync: false   # set manually in Render dashboard
+      - key: SUPABASE_KEY
+        sync: false   # set manually in Render dashboard
+      # PORT is set automatically by Render — do not override
