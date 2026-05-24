@@ -2,27 +2,29 @@
 //  STOCK NEXUS — app.js
 // ═══════════════════════════════════════════════════════════
 
-let ngStocks = [], usStocks = [];
-let marketNg = {}, marketUs = {};
+let euStocks = [], asiaStocks = [], usStocks = [];
+let marketEu = {}, marketAs = {}, marketUs = {};
 let currentPage = "dashboard";
 let sseSource = null;
 let selectedStock = null;
-let predMarket = "ng";
+let predMarket = "eu";
 let scanMarket = "both";
-let ngSectorFilter = "ALL";
+let euSectorFilter = "ALL";
 let usSectorFilter = "ALL";
+const CURR_SYMS = {"USD":"$","EUR":"€","GBP":"p","JPY":"¥","HKD":"HK$","INR":"₹","KRW":"₩","CHF":"Fr","DKK":"kr","SEK":"kr","NGN":"₦"};
 let trades = JSON.parse(localStorage.getItem("sn_trades") || "[]");
 
 // ── FORMAT HELPERS ─────────────────────────────────────────────
 function fp(v, currency = "USD") {
   if (v == null || isNaN(v)) return "—";
-  const sym = currency === "NGN" ? "₦" : "$";
+  const sym = CURR_SYMS[currency] || "$";
   if (v >= 1e12) return sym + (v/1e12).toFixed(2) + "T";
   if (v >= 1e9)  return sym + (v/1e9).toFixed(2) + "B";
   if (v >= 1e6)  return sym + (v/1e6).toFixed(2) + "M";
   if (v >= 1000) return sym + v.toLocaleString("en", {minimumFractionDigits:2,maximumFractionDigits:2});
   return sym + v.toFixed(2);
 }
+function currSym(currency) { return CURR_SYMS[currency] || "$"; }
 function fpRaw(v) {
   if (v == null || isNaN(v)) return "—";
   if (v >= 1000) return v.toLocaleString("en", {minimumFractionDigits:2,maximumFractionDigits:2});
@@ -55,13 +57,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   try {
     const res  = await fetch("/api/seed");
     const data = await res.json();
-    ngStocks = data.ng_stocks || [];
-    usStocks = data.us_stocks || [];
-    marketNg = data.market_ng || {};
-    marketUs = data.market_us || {};
+    euStocks   = data.eu_stocks   || [];
+    asiaStocks = data.asia_stocks || [];
+    usStocks   = data.us_stocks   || [];
+    marketEu   = data.market_eu   || {};
+    marketAs   = data.market_as   || {};
+    marketUs   = data.market_us   || {};
 
     renderDashboard();
-    renderNgxPage();
+    renderEuAsiaPage();
     renderUsPage();
     renderPredSidebar();
     renderJournal();
@@ -113,7 +117,8 @@ function startSSE() {
   sseSource.onmessage = e => {
     const msg = JSON.parse(e.data);
     if (msg.type === "snapshot") {
-      marketNg = msg.market_ng || marketNg;
+      marketEu = msg.market_eu || marketEu;
+      marketAs = msg.market_as || marketAs;
       marketUs = msg.market_us || marketUs;
       refreshAll();
       setWsStatus("simulated");
@@ -134,11 +139,16 @@ function setWsStatus(s) {
 
 function handleTick(msg) {
   const {id, market, price, change} = msg;
-  if (market === "ng" && marketNg[id]) {
-    const prev = marketNg[id].price;
-    marketNg[id].price  = price;
-    marketNg[id].change = change;
-    updateTopBarNg(id, price);
+  if (market === "eu" && marketEu[id]) {
+    const prev = marketEu[id].price;
+    marketEu[id].price  = price;
+    marketEu[id].change = change;
+    updateTopBarEu(id, price);
+    flashCell(id, price > prev ? "up" : price < prev ? "down" : "");
+  } else if (market === "as" && marketAs[id]) {
+    const prev = marketAs[id].price;
+    marketAs[id].price  = price;
+    marketAs[id].change = change;
     flashCell(id, price > prev ? "up" : price < prev ? "down" : "");
   } else if (market === "us" && marketUs[id]) {
     const prev = marketUs[id].price;
@@ -160,10 +170,10 @@ function flashCell(id, dir) {
   el.classList.add(dir === "up" ? "tick-up" : "tick-down");
 }
 
-function updateTopBarNg(id, price) {
-  if (id === "DANGCEM") {
+function updateTopBarEu(id, price) {
+  if (id === "ASML.AS") {
     const el = document.getElementById("hdr-dangcem");
-    if (el) el.textContent = "₦" + fpRaw(price);
+    if (el) el.textContent = "€" + fpRaw(price);
   }
 }
 function updateTopBarUs(id, price) {
@@ -175,7 +185,7 @@ function updateTopBarUs(id, price) {
 
 function refreshAll() {
   renderDashboard();
-  if (currentPage === "ngx") renderNgxPage();
+  if (currentPage === "ngx") renderEuAsiaPage();
   if (currentPage === "us")  renderUsPage();
 }
 
@@ -187,17 +197,18 @@ function renderDashboard() {
 }
 
 function updateDashKPIs() {
-  const allNg = ngStocks.map(s => ({...s, ...marketNg[s.id]}));
-  const allUs = usStocks.map(s => ({...s, ...marketUs[s.id]}));
-  const all = [...allNg, ...allUs];
+  const allEu   = euStocks.map(s => ({...s, ...marketEu[s.id]}));
+  const allAs   = asiaStocks.map(s => ({...s, ...marketAs[s.id]}));
+  const allUs   = usStocks.map(s => ({...s, ...marketUs[s.id]}));
+  const all = [...allEu, ...allAs, ...allUs];
   const total = all.length;
   const bulls = all.filter(s => (s.change||0) > 0).length;
   const bears = all.filter(s => (s.change||0) < 0).length;
   const flat  = total - bulls - bears;
   const topGainer = [...all].sort((a,b)=>(b.change||0)-(a.change||0))[0];
   const topLoser  = [...all].sort((a,b)=>(a.change||0)-(b.change||0))[0];
-  const spyData   = marketUs["SPY"];
-  const dangData  = marketNg["DANGCEM"];
+  const spyData  = marketUs["SPY"];
+  const asmlData = marketEu["ASML.AS"];
 
   document.getElementById("kpi-grid").innerHTML = `
     <div class="kpi-card" style="--accent:var(--green)">
@@ -206,9 +217,9 @@ function updateDashKPIs() {
       <div class="kpi-sub">${bears} bearish · ${flat} flat</div>
     </div>
     <div class="kpi-card" style="--accent:var(--ng-green)">
-      <div class="kpi-label">DANGCEM (NGX)</div>
-      <div class="kpi-val" style="color:var(--ng-green)">₦${fpRaw(dangData?.price||0)}</div>
-      <div class="kpi-sub" style="color:${chColor(dangData?.change||0)}">${fPct(dangData?.change||0)}</div>
+      <div class="kpi-label">ASML (EU)</div>
+      <div class="kpi-val" style="color:var(--ng-green)">€${fpRaw(asmlData?.price||0)}</div>
+      <div class="kpi-sub" style="color:${chColor(asmlData?.change||0)}">${fPct(asmlData?.change||0)}</div>
     </div>
     <div class="kpi-card" style="--accent:var(--us-blue)">
       <div class="kpi-label">S&P 500 ETF (SPY)</div>
@@ -228,13 +239,15 @@ function updateDashKPIs() {
 }
 
 function renderDashMovers() {
-  const ngSorted = [...ngStocks].sort((a,b)=>Math.abs(marketNg[b.id]?.change||0)-Math.abs(marketNg[a.id]?.change||0));
-  const usSorted = [...usStocks].sort((a,b)=>Math.abs(marketUs[b.id]?.change||0)-Math.abs(marketUs[a.id]?.change||0));
+  const allEuAs = [...euStocks, ...asiaStocks];
+  const euAsMkt = id => marketEu[id] || marketAs[id] || {};
+  const euAsSorted = [...allEuAs].sort((a,b)=>Math.abs(euAsMkt(b.id)?.change||0)-Math.abs(euAsMkt(a.id)?.change||0));
+  const usSorted   = [...usStocks].sort((a,b)=>Math.abs(marketUs[b.id]?.change||0)-Math.abs(marketUs[a.id]?.change||0));
 
   const row = (s, mkt) => {
-    const d = (mkt==="ng"?marketNg:marketUs)[s.id] || {};
+    const d = mkt==="us" ? marketUs[s.id]||{} : euAsMkt(s.id);
     const ch = d.change || 0;
-    const sym = mkt==="ng"?"₦":"$";
+    const sym = currSym(s.currency || "USD");
     return `<div class="stock-row" onclick="quickSelect('${s.id}','${mkt}')">
       <div style="display:flex;align-items:center;gap:8px">
         <div class="stock-icon" style="background:${s.color}22;color:${s.color}">${s.id.slice(0,4)}</div>
@@ -250,25 +263,28 @@ function renderDashMovers() {
     </div>`;
   };
 
-  document.getElementById("dash-ng-movers").innerHTML = ngSorted.slice(0,5).map(s=>row(s,"ng")).join("");
+  const euMkt = s => euStocks.find(x=>x.id===s.id) ? "eu" : "as";
+  document.getElementById("dash-ng-movers").innerHTML = euAsSorted.slice(0,5).map(s=>row(s, euMkt(s))).join("");
   document.getElementById("dash-us-movers").innerHTML = usSorted.slice(0,5).map(s=>row(s,"us")).join("");
 
   // leaders / laggards
   const allWithMkt = [
-    ...ngStocks.map(s=>({...s, mkt:"ng", change: marketNg[s.id]?.change||0, price: marketNg[s.id]?.price||0})),
+    ...euStocks.map(s=>({...s, mkt:"eu", change: marketEu[s.id]?.change||0, price: marketEu[s.id]?.price||0})),
+    ...asiaStocks.map(s=>({...s, mkt:"as", change: marketAs[s.id]?.change||0, price: marketAs[s.id]?.price||0})),
     ...usStocks.map(s=>({...s, mkt:"us", change: marketUs[s.id]?.change||0, price: marketUs[s.id]?.price||0}))
   ];
   const leaders  = [...allWithMkt].sort((a,b)=>b.change-a.change).slice(0,5);
   const laggards = [...allWithMkt].sort((a,b)=>a.change-b.change).slice(0,5);
 
+  const mktFlag = m => m==="eu"?"🌍":m==="as"?"🌏":"🇺🇸";
   const glRow = s => {
-    const sym = s.mkt==="ng"?"₦":"$";
+    const sym = currSym(s.currency || "USD");
     return `<div class="stock-row" onclick="quickSelect('${s.id}','${s.mkt}')">
       <div style="display:flex;align-items:center;gap:8px">
         <div class="stock-icon" style="background:${s.color}22;color:${s.color};width:24px;height:24px;font-size:7px">${s.id.slice(0,3)}</div>
         <div>
           <div style="font-size:11px;font-weight:700">${s.id}</div>
-          <div style="font-size:8px;color:var(--text3)">${s.mkt==="ng"?"🇳🇬":"🇺🇸"} ${sym}${fpRaw(s.price)}</div>
+          <div style="font-size:8px;color:var(--text3)">${mktFlag(s.mkt)} ${sym}${fpRaw(s.price)}</div>
         </div>
       </div>
       <div style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:${chColor(s.change)}">${fPct(s.change)}</div>
@@ -280,7 +296,8 @@ function renderDashMovers() {
 
 function renderHeatmap() {
   const all = [
-    ...ngStocks.map(s=>({...s, mkt:"ng", change: marketNg[s.id]?.change||0})),
+    ...euStocks.map(s=>({...s, mkt:"eu", change: marketEu[s.id]?.change||0})),
+    ...asiaStocks.map(s=>({...s, mkt:"as", change: marketAs[s.id]?.change||0})),
     ...usStocks.map(s=>({...s, mkt:"us", change: marketUs[s.id]?.change||0}))
   ];
   document.getElementById("heatmap").innerHTML = all.map(s => {
@@ -312,36 +329,41 @@ function updateHeatCell(id, change) {
   el.children[1].textContent = fPct(ch);
 }
 
-// ── NGX PAGE ───────────────────────────────────────────────────
-function renderNgxPage() {
-  const sectors = ["ALL", ...new Set(ngStocks.map(s=>s.sector))];
+// ── EU/ASIA PAGE ──────────────────────────────────────────────
+function renderEuAsiaPage() {
+  const allEuAs = [...euStocks, ...asiaStocks];
+  const sectors = ["ALL", ...new Set(allEuAs.map(s=>s.sector))];
   document.getElementById("ngx-sector-filters").innerHTML = sectors.map(s =>
-    `<button class="cat-btn${s===ngSectorFilter?" active":""}" onclick="setNgxSector('${s}')">${s}</button>`
+    `<button class="cat-btn${s===euSectorFilter?" active":""}" onclick="setEuSector('${s}')">${s}</button>`
   ).join("");
 
-  const filtered = ngSectorFilter === "ALL" ? ngStocks : ngStocks.filter(s=>s.sector===ngSectorFilter);
+  const filtered = euSectorFilter === "ALL" ? allEuAs : allEuAs.filter(s=>s.sector===euSectorFilter);
   document.getElementById("ngx-list").innerHTML = filtered.map((s,i) => {
-    const d = marketNg[s.id] || {};
+    const isEu = !!euStocks.find(x=>x.id===s.id);
+    const d = isEu ? (marketEu[s.id]||{}) : (marketAs[s.id]||{});
+    const mktType = isEu ? "eu" : "as";
     const ch = d.change || 0;
-    return `<div class="table-row-ng" onclick="quickSelect('${s.id}','ng')">
+    const sym = currSym(s.currency || "EUR");
+    const flag = isEu ? "🌍" : "🌏";
+    return `<div class="table-row-ng" onclick="quickSelect('${s.id}','${mktType}')">
       <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${i+1}</div>
       <div style="display:flex;align-items:center;gap:8px">
         <div class="stock-icon" style="background:${s.color}22;color:${s.color};width:28px;height:28px;font-size:7px">${s.id.slice(0,4)}</div>
         <div>
-          <div style="font-family:var(--font-main);font-size:13px;font-weight:600">${s.id}</div>
+          <div style="font-family:var(--font-main);font-size:13px;font-weight:600">${flag} ${s.id}</div>
           <div style="font-family:var(--font-mono);font-size:7px;color:var(--text3)">${s.name}</div>
         </div>
       </div>
-      <div id="price-${s.id}" style="font-family:var(--font-mono);font-size:12px;color:${chColor(ch)}">₦${fpRaw(d.price||0)}</div>
+      <div id="price-${s.id}" style="font-family:var(--font-mono);font-size:12px;color:${chColor(ch)}">${sym}${fpRaw(d.price||0)}</div>
       <div style="font-family:var(--font-mono);font-size:11px;color:${chColor(ch)}">${fPct(ch)}</div>
-      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">₦${fpRaw(d.high||0)} / ₦${fpRaw(d.low||0)}</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${sym}${fpRaw(d.high||0)} / ${sym}${fpRaw(d.low||0)}</div>
       <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${fmtVol(d.vol||0)}</div>
       <div style="font-family:var(--font-mono);font-size:9px;color:var(--text2)">${s.sector}</div>
       <div>${quickSignal(ch)}</div>
     </div>`;
   }).join("");
 }
-function setNgxSector(s) { ngSectorFilter = s; renderNgxPage(); }
+function setEuSector(s) { euSectorFilter = s; renderEuAsiaPage(); }
 
 // ── US PAGE ────────────────────────────────────────────────────
 function renderUsPage() {
@@ -394,14 +416,18 @@ function setPredMarket(mkt) {
   document.getElementById("pred-content").innerHTML = `<div class="empty-state"><div class="empty-title">STOCK NEXUS</div><div class="empty-sub">SELECT A STOCK AND CLICK ANALYZE<br/>FOR AI-POWERED EQUITY PREDICTIONS</div></div>`;
 }
 
+function getMktList(mkt)  { return mkt==="eu"?euStocks:mkt==="as"?asiaStocks:usStocks; }
+function getMktData(mkt)  { return mkt==="eu"?marketEu:mkt==="as"?marketAs:marketUs; }
+function getMktFlag(mkt)  { return mkt==="eu"?"🌍 EU":mkt==="as"?"🌏 ASIA":"🇺🇸 US"; }
+
 function renderPredSidebar() {
-  const list = predMarket === "ng" ? ngStocks : usStocks;
-  const mkt  = predMarket === "ng" ? marketNg : marketUs;
-  const sym  = predMarket === "ng" ? "₦" : "$";
+  const list = getMktList(predMarket);
+  const mkt  = getMktData(predMarket);
   document.getElementById("pred-stocklist").innerHTML = list.map(s => {
-    const d = mkt[s.id] || {};
-    const ch = d.change || 0;
-    return `<div class="pred-coin-item${selectedStock===s.id?" active":""}" 
+    const d   = mkt[s.id] || {};
+    const ch  = d.change || 0;
+    const sym = currSym(s.currency || "USD");
+    return `<div class="pred-coin-item${selectedStock===s.id?" active":""}"
       id="pred-item-${s.id}" onclick="selectStock('${s.id}','${predMarket}')">
       <div class="pred-coin-icon" style="background:${s.color}22;color:${s.color}">${s.id.slice(0,4)}</div>
       <div>
@@ -417,13 +443,13 @@ function renderPredSidebar() {
 }
 
 function filterPredStocks(q) {
-  const list = predMarket === "ng" ? ngStocks : usStocks;
-  const mkt  = predMarket === "ng" ? marketNg : marketUs;
-  const sym  = predMarket === "ng" ? "₦" : "$";
+  const list = getMktList(predMarket);
+  const mkt  = getMktData(predMarket);
   const filtered = q ? list.filter(s => s.id.toLowerCase().includes(q.toLowerCase()) || s.name.toLowerCase().includes(q.toLowerCase())) : list;
   document.getElementById("pred-stocklist").innerHTML = filtered.map(s => {
-    const d = mkt[s.id] || {};
-    const ch = d.change || 0;
+    const d   = mkt[s.id] || {};
+    const ch  = d.change || 0;
+    const sym = currSym(s.currency || "USD");
     return `<div class="pred-coin-item${selectedStock===s.id?" active":""}"
       onclick="selectStock('${s.id}','${predMarket}')">
       <div class="pred-coin-icon" style="background:${s.color}22;color:${s.color}">${s.id.slice(0,4)}</div>
@@ -442,12 +468,12 @@ function filterPredStocks(q) {
 function selectStock(id, mkt) {
   selectedStock = id;
   predMarket = mkt;
-  const list = mkt === "ng" ? ngStocks : usStocks;
-  const mkd  = mkt === "ng" ? marketNg : marketUs;
+  const list = getMktList(mkt);
+  const mkd  = getMktData(mkt);
   const info = list.find(s => s.id === id);
   const d    = mkd[id] || {};
   const ch   = d.change || 0;
-  const sym  = mkt === "ng" ? "₦" : "$";
+  const sym  = currSym(info?.currency || "USD");
 
   document.querySelectorAll(".pred-coin-item").forEach(el => el.classList.remove("active"));
   const el = document.getElementById("pred-item-" + id);
@@ -458,7 +484,7 @@ function selectStock(id, mkt) {
       <div class="pred-stock-icon" style="background:${info?.color||"#333"}22;color:${info?.color||"#fff"}">${id.slice(0,4)}</div>
       <div>
         <div class="pred-stock-id">${id}</div>
-        <div class="pred-stock-name">${info?.name||""} · ${mkt==="ng"?"🇳🇬 NGX":"🇺🇸 US"}</div>
+        <div class="pred-stock-name">${info?.name||""} · ${getMktFlag(mkt)}</div>
       </div>
       <div style="margin-left:auto;text-align:right">
         <div class="pred-stock-price" style="color:${chColor(ch)}">${sym}${fpRaw(d.price||0)}</div>
@@ -486,7 +512,9 @@ function quickSelect(id, mkt) {
 
 function updatePredHeaderPrice(id, price, change) {
   if (id !== selectedStock) return;
-  const sym = predMarket === "ng" ? "₦" : "$";
+  const list = getMktList(predMarket);
+  const info = list.find(s => s.id === id);
+  const sym = currSym(info?.currency || "USD");
   const prEl = document.querySelector(".pred-stock-price");
   const chEl = document.querySelector(".pred-stock-ch");
   if (prEl) { prEl.textContent = sym + fpRaw(price); prEl.style.color = chColor(change); }
@@ -539,7 +567,7 @@ function renderAnalysisResult(d, balance, riskPct) {
   const stop  = d.prediction?.targets?.stop;
   const rr    = d.prediction?.rr;
   const ind   = d.indicators || {};
-  const sym   = d.stockInfo?.currency === "NGN" ? "₦" : "$";
+  const sym   = currSym(d.stockInfo?.currency || "USD");
   const price = d.price || 0;
   const change= d.change || 0;
   const color = d.stockInfo?.color || "#4A9EFF";
@@ -680,7 +708,7 @@ function renderAnalysisResult(d, balance, riskPct) {
       </div>
       <div class="analysis-card">
         <div class="analysis-label">MARKET CAP</div>
-        <div class="analysis-val" style="font-size:18px">${(predMarket==="ng"?marketNg:marketUs)[selectedStock]?.mktcap||"—"}</div>
+        <div class="analysis-val" style="font-size:18px">${getMktData(predMarket)[selectedStock]?.mktcap||"—"}</div>
         <div class="analysis-sub">${d.stockInfo?.sector||""}</div>
       </div>
       <div class="analysis-card">
@@ -825,12 +853,13 @@ function renderScanResults(data) {
     <div class="scanner-grid">
       ${results.map(r => {
         const sigColor = dirColor(r.direction);
-        const sym = r.currency==="NGN"?"₦":"$";
+        const sym = currSym(r.currency || "USD");
+        const mktLabel = r.market==="eu"?"🌍 EU":r.market==="as"?"🌏 ASIA":"🇺🇸 US";
         return `<div class="scan-card ${r.direction==="BULLISH"?"bull":"bear"}" onclick="quickSelect('${r.id}','${r.market}')">
           <div class="scan-header">
             <div>
               <div class="scan-name" style="color:${r.color}">${r.id}</div>
-              <div class="scan-mkt">${r.market==="ng"?"🇳🇬 NGX":"🇺🇸 US"} · ${r.sector}</div>
+              <div class="scan-mkt">${mktLabel} · ${r.sector}</div>
             </div>
             <div>
               <div class="scan-conf" style="color:${sigColor}">${r.conf}%</div>
@@ -898,7 +927,7 @@ async function runChartAnalysis() {
 
   // Pass current indicators if a stock is selected in the analysis panel
   if (selectedStock) {
-    const mkt = predMarket === "ng" ? marketNg : marketUs;
+    const mkt = getMktData(predMarket);
     const state = mkt[selectedStock] || {};
     // Send whatever indicator data we have for better matching
     const indProxy = {
@@ -1027,7 +1056,7 @@ function addJournalTrade() {
 function closeTrade(id) {
   const trade = trades.find(t => t.id === id);
   if (!trade) return;
-  const mkt = trade.mkt === "ng" ? marketNg : marketUs;
+  const mkt = getMktData(trade.mkt);
   const currentPrice = mkt[trade.stock]?.price || trade.entry;
   trade.exitPrice = currentPrice;
   trade.exitDate  = new Date().toISOString().slice(0,10);
@@ -1045,7 +1074,7 @@ function deleteTrade(id) {
 function saveTrades() { localStorage.setItem("sn_trades", JSON.stringify(trades)); }
 
 function calcPnL(t) {
-  const exitP = t.exitPrice || (t.mkt==="ng"?marketNg:marketUs)[t.stock]?.price || t.entry;
+  const exitP = t.exitPrice || getMktData(t.mkt)[t.stock]?.price || t.entry;
   const mult  = t.dir === "LONG" ? 1 : -1;
   return round2((exitP - t.entry) * t.qty * mult);
 }
@@ -1055,18 +1084,21 @@ function renderJournal() {
   const open   = trades.filter(t => t.status === "OPEN");
   const closed = trades.filter(t => t.status === "CLOSED");
 
-  // Separate P&L by currency to avoid mixing NGN and USD
-  const ngClosed = closed.filter(t => t.mkt === "ng");
-  const usClosed = closed.filter(t => t.mkt === "us");
-  const ngPnL = ngClosed.reduce((a,t) => a + calcPnL(t), 0);
-  const usPnL = usClosed.reduce((a,t) => a + calcPnL(t), 0);
+  // Group P&L by market/currency
+  const usClosed  = closed.filter(t => t.mkt === "us");
+  const euClosed  = closed.filter(t => t.mkt === "eu");
+  const asClosed  = closed.filter(t => t.mkt === "as");
+  const usPnL  = usClosed.reduce((a,t) => a + calcPnL(t), 0);
+  const euPnL  = euClosed.reduce((a,t) => a + calcPnL(t), 0);
+  const asPnL  = asClosed.reduce((a,t) => a + calcPnL(t), 0);
   const wins    = closed.filter(t => calcPnL(t) > 0).length;
   const losses  = closed.filter(t => calcPnL(t) <= 0).length;
   const winRate = closed.length ? round2(wins/closed.length*100) : 0;
 
   const pnlDisplay = [
-    ngClosed.length ? `<span style="color:${ngPnL>=0?"var(--green)":"var(--red)"}">₦${ngPnL>=0?"+":""}${fpRaw(ngPnL)}</span>` : "",
-    usClosed.length ? `<span style="color:${usPnL>=0?"var(--green)":"var(--red)"}">$${usPnL>=0?"+":""}${fpRaw(usPnL)}</span>` : "",
+    euClosed.length ? `<span style="color:${euPnL>=0?"var(--green)":"var(--red)"}">€${euPnL>=0?"+":""}${fpRaw(euPnL)} EU</span>` : "",
+    asClosed.length ? `<span style="color:${asPnL>=0?"var(--green)":"var(--red)"}">¥${asPnL>=0?"+":""}${fpRaw(asPnL)} ASIA</span>` : "",
+    usClosed.length ? `<span style="color:${usPnL>=0?"var(--green)":"var(--red)"}">$${usPnL>=0?"+":""}${fpRaw(usPnL)} US</span>` : "",
   ].filter(Boolean).join(" · ") || "—";
 
   document.getElementById("journal-stats").innerHTML = `
@@ -1106,12 +1138,13 @@ function renderJournal() {
     </div>`;
 
   const tradeRow = t => {
-    const mkt = t.mkt === "ng" ? marketNg : marketUs;
+    const mkt  = getMktData(t.mkt);
     const cur  = t.exitPrice || mkt[t.stock]?.price || t.entry;
     const pnl  = calcPnL(t);
-    const sym  = t.mkt === "ng" ? "₦" : "$";
+    const sym  = t.mkt==="eu"?"€":t.mkt==="as"?"¥":"$";
+    const flag = t.mkt==="eu"?"🌍":t.mkt==="as"?"🌏":"🇺🇸";
     return `<div class="jnl-row">
-      <div style="font-size:9px">${t.mkt==="ng"?"🇳🇬":"🇺🇸"}</div>
+      <div style="font-size:9px">${flag}</div>
       <div style="font-weight:700;color:var(--text)">${t.stock}</div>
       <div style="color:${t.dir==="LONG"?"var(--green)":"var(--red)"}">${t.dir}</div>
       <div>${sym}${fpRaw(t.entry)}</div>

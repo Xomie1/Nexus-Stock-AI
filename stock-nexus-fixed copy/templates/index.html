@@ -13,7 +13,7 @@
 <!-- TOP BAR -->
 <div class="topbar">
   <div class="topbar-left">
-    <span class="logo-ng">NGX</span>
+    <span class="logo-ng">EU/AS</span>
     <span class="logo-div">✦</span>
     <span class="logo-main">STOCK</span>
     <span class="logo-nexus">NEXUS</span>
@@ -22,7 +22,7 @@
   <div class="topbar-right">
     <div class="market-pill ng-pill" id="ngx-status-pill">
       <span class="pill-dot"></span>
-      <span>NGX</span>
+      <span>EU/AS</span>
       <span id="hdr-dangcem" class="price-neutral">—</span>
     </div>
     <div class="market-pill us-pill" id="us-status-pill">
@@ -42,7 +42,7 @@
   <!-- SIDEBAR -->
   <nav class="sidebar">
     <button class="nav-item active" data-page="dashboard"><span class="nav-icon">⬛</span><span>DASH</span></button>
-    <button class="nav-item" data-page="ngx"><span class="nav-icon">🇳🇬</span><span>NGX</span></button>
+    <button class="nav-item" data-page="ngx"><span class="nav-icon">🌍</span><span>EU/AS</span></button>
     <button class="nav-item" data-page="us"><span class="nav-icon">🇺🇸</span><span>NYSE</span></button>
     <button class="nav-item" data-page="predictor"><span class="nav-icon">✦</span><span>SIGNAL</span></button>
     <button class="nav-item" data-page="scanner"><span class="nav-icon">⚡</span><span>SCAN</span></button>
@@ -58,14 +58,14 @@
       <div class="page-header">
         <div>
           <h1 class="page-title">Market Overview</h1>
-          <div class="page-sub">NIGERIAN & US EQUITY INTELLIGENCE</div>
+          <div class="page-sub">GLOBAL EQUITY INTELLIGENCE</div>
         </div>
         <span id="dash-ws" class="ws-badge connecting"><span class="ws-dot"></span> CONNECTING</span>
       </div>
       <div class="kpi-grid" id="kpi-grid"></div>
       <div class="two-col" style="margin-top:20px">
         <div class="card">
-          <div class="section-title ngx-label">🇳🇬 NGX — TOP MOVERS</div>
+          <div class="section-title ngx-label">🌍 EU/ASIA — TOP MOVERS</div>
           <div id="dash-ng-movers"></div>
         </div>
         <div class="card">
@@ -89,18 +89,18 @@
       </div>
     </div>
 
-    <!-- ══════════════════ NGX PAGE ══════════════════ -->
+    <!-- ══════════════════ EU/ASIA PAGE ══════════════════ -->
     <div id="page-ngx" class="page">
       <div class="page-header">
         <div>
-          <h1 class="page-title" style="color:var(--ng-green)">Nigerian Exchange</h1>
-          <div class="page-sub">NGX — 100+ LISTED STOCKS · LIVE PRICES (₦)</div>
+          <h1 class="page-title" style="color:var(--ng-green)">European &amp; Asian Markets</h1>
+          <div class="page-sub">EU &amp; ASIA — 49 LISTED STOCKS · LIVE PRICES</div>
         </div>
         <div class="cat-filters" id="ngx-sector-filters"></div>
       </div>
       <div class="card">
         <div class="markets-header table-row">
-          <div>#</div><div>STOCK</div><div>PRICE (₦)</div>
+          <div>#</div><div>STOCK</div><div>PRICE</div>
           <div>CHANGE %</div><div>HIGH/LOW</div><div>VOLUME</div>
           <div>SECTOR</div><div>SIGNAL</div>
         </div>
@@ -113,7 +113,7 @@
       <div class="page-header">
         <div>
           <h1 class="page-title" style="color:var(--us-blue)">US Markets</h1>
-          <div class="page-sub">NYSE / NASDAQ — 20 STOCKS & ETFs · LIVE PRICES ($)</div>
+          <div class="page-sub">NYSE / NASDAQ — 76 STOCKS & ETFs · LIVE PRICES ($)</div>
         </div>
         <div class="cat-filters" id="us-sector-filters"></div>
       </div>
@@ -131,7 +131,8 @@
     <div id="page-predictor" class="page predictor-layout">
       <div class="pred-sidebar">
         <div class="pred-mkt-toggle">
-          <button class="mkt-btn active" data-mkt="ng" onclick="setPredMarket('ng')">🇳🇬 NGX</button>
+          <button class="mkt-btn active" data-mkt="eu" onclick="setPredMarket('eu')">🌍 EU</button>
+          <button class="mkt-btn" data-mkt="as" onclick="setPredMarket('as')">🌏 ASIA</button>
           <button class="mkt-btn" data-mkt="us" onclick="setPredMarket('us')">🇺🇸 US</button>
         </div>
         <div class="coin-search-wrap">
@@ -171,12 +172,13 @@
       <div class="page-header">
         <div>
           <h1 class="page-title">Signal Scanner</h1>
-          <div class="page-sub">FULL TECHNICAL SCAN · ALL NGX & US STOCKS</div>
+          <div class="page-sub">FULL TECHNICAL SCAN · ALL EU, ASIAN &amp; US STOCKS</div>
         </div>
         <div style="display:flex;gap:10px">
           <div class="cat-filters">
             <button class="cat-btn active" data-mkt="both" onclick="setScanMarket('both',this)">ALL</button>
-            <button class="cat-btn" data-mkt="ng" onclick="setScanMarket('ng',this)">🇳🇬 NGX</button>
+            <button class="cat-btn" data-mkt="eu" onclick="setScanMarket('eu',this)">🌍 EU</button>
+            <button class="cat-btn" data-mkt="as" onclick="setScanMarket('as',this)">🌏 ASIA</button>
             <button class="cat-btn" data-mkt="us" onclick="setScanMarket('us',this)">🇺🇸 US</button>
           </div>
           <button class="btn-primary" id="scan-btn">⚡ RUN SCAN</button>
@@ -185,7 +187,7 @@
       <div id="scanner-content">
         <div class="empty-state">
           <div class="empty-title" style="font-size:36px">⚡</div>
-          <div class="empty-sub">RUN SCAN TO SURFACE HIGH-CONFIDENCE SETUPS<br/>ACROSS ALL NGX & US STOCKS</div>
+          <div class="empty-sub">RUN SCAN TO SURFACE HIGH-CONFIDENCE SETUPS<br/>ACROSS ALL EU, ASIAN &amp; US STOCKS</div>
         </div>
       </div>
     </div>
@@ -214,7 +216,7 @@
           <div style="margin-top:16px">
             <div class="trade-size-label" style="margin-bottom:6px">STOCK / ASSET CONTEXT (optional)</div>
             <input type="text" id="chart-context-input" class="coin-search" style="width:100%;box-sizing:border-box"
-                   placeholder="e.g. DANGCEM NGX daily chart, AAPL 4H..."/>
+                   placeholder="e.g. ASML EU daily chart, AAPL 4H..."/>
           </div>
           <button class="btn-primary" id="chart-analyze-btn" style="width:100%;margin-top:14px" onclick="runChartAnalysis()">
             👁 ANALYZE CHART WITH AI
@@ -236,7 +238,7 @@
       <div class="page-header">
         <div>
           <h1 class="page-title">Trade Journal</h1>
-          <div class="page-sub">NGX & US EQUITY POSITIONS · P&L TRACKER</div>
+          <div class="page-sub">GLOBAL EQUITY POSITIONS · P&amp;L TRACKER</div>
         </div>
         <div style="display:flex;gap:8px">
           <button class="btn-secondary" id="add-trade-btn">+ ADD TRADE</button>
@@ -249,13 +251,14 @@
           <div class="field-group">
             <label>MARKET</label>
             <select id="jnl-market" class="trade-size-input">
-              <option value="ng">🇳🇬 NGX</option>
+              <option value="eu">🌍 EU</option>
+              <option value="as">🌏 ASIA</option>
               <option value="us">🇺🇸 US</option>
             </select>
           </div>
           <div class="field-group">
             <label>STOCK</label>
-            <input type="text" id="jnl-stock" class="trade-size-input" placeholder="e.g. DANGCEM"/>
+            <input type="text" id="jnl-stock" class="trade-size-input" placeholder="e.g. ASML"/>
           </div>
           <div class="field-group">
             <label>DIRECTION</label>
