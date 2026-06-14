@@ -696,76 +696,147 @@ html, body {
 }
 .trade-brief.brief-long  { border-color: rgba(0,230,118,0.3);  background: rgba(0,230,118,0.03); }
 .trade-brief.brief-short { border-color: rgba(255,61,87,0.3);  background: rgba(255,61,87,0.03); }
-.trade-brief.brief-wait  { border-color: rgba(255,167,38,0.25); text-align: center; padding: 24px; }
+.trade-brief.brief-wait  { border-color: rgba(255,167,38,0.2); text-align: center; padding: 28px; }
+.brief-wait-label { font-family: var(--font-title); font-size: 24px; color: var(--amber); letter-spacing: 3px; margin-bottom: 8px; }
+.brief-wait-sub   { font-family: var(--font-mono); font-size: 10px; color: var(--text3); line-height: 1.7; }
 
-.brief-top {
+.brief-header-row {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 10px;
+  align-items: center;
+  margin-bottom: 14px;
 }
 .brief-action-badge {
   font-family: var(--font-title);
-  font-size: 26px;
-  letter-spacing: 3px;
-  padding: 4px 16px;
+  font-size: 28px;
+  letter-spacing: 4px;
+  padding: 4px 18px;
   border-radius: 4px;
+  display: inline-block;
 }
-.brief-conf-bar {
-  height: 3px;
-  background: var(--border);
-  border-radius: 2px;
+.brief-data-src {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text3);
+  margin-left: 10px;
+}
+.brief-conf-wrap { text-align: right; min-width: 90px; }
+.brief-conf-num  { font-family: var(--font-title); font-size: 30px; line-height: 1; }
+.brief-conf-lbl  { font-family: var(--font-mono); font-size: 8px; color: var(--text3); letter-spacing: 1px; margin-bottom: 4px; }
+.brief-conf-track { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; width: 90px; }
+.brief-conf-fill  { height: 100%; border-radius: 2px; transition: width .5s ease; }
+
+/* ── PROFIT METER ───────────────────────────────────── */
+.profit-meter {
+  display: flex;
+  align-items: stretch;
+  height: 64px;
+  border-radius: 6px;
+  overflow: visible;
   margin-bottom: 14px;
+  position: relative;
+  gap: 2px;
+}
+.pm-sl, .pm-tp1, .pm-tp2 {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 6px 8px;
+  border-radius: 4px;
+  min-width: 0;
   overflow: hidden;
 }
-.brief-levels-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 8px;
-  margin-bottom: 12px;
+.pm-sl  { background: rgba(255,61,87,0.15);  border: 1px solid rgba(255,61,87,0.3); }
+.pm-tp1 { background: rgba(0,230,118,0.1);   border: 1px solid rgba(0,230,118,0.25); }
+.pm-tp2 { background: rgba(0,188,212,0.1);   border: 1px solid rgba(0,188,212,0.2); }
+.pm-entry {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 2px;
+  background: var(--text);
+  position: relative;
+  flex-shrink: 0;
+  overflow: visible;
 }
-.brief-level-card {
-  background: var(--bg4);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 10px 12px;
+.pm-entry-dot {
+  width: 10px; height: 10px;
+  background: var(--text);
+  border-radius: 50%;
+  border: 2px solid var(--bg);
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
 }
-.blc-label {
+.pm-entry-label {
+  position: absolute;
+  top: -22px;
+  left: 50%;
+  transform: translateX(-50%);
   font-family: var(--font-mono);
   font-size: 8px;
-  color: var(--text3);
-  letter-spacing: 1px;
-  margin-bottom: 4px;
-}
-.blc-price {
-  font-family: var(--font-title);
-  font-size: 17px;
   color: var(--text);
-  margin-bottom: 2px;
+  white-space: nowrap;
+  text-align: center;
+  line-height: 1.3;
 }
-.blc-pct { font-family: var(--font-mono); font-size: 9px; }
-.brief-why {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 12px 14px;
-  margin-bottom: 10px;
+.pm-label { font-family: var(--font-mono); font-size: 8px; color: var(--text3); letter-spacing: 1px; }
+.pm-val   { font-family: var(--font-title); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pm-pct   { font-family: var(--font-mono); font-size: 8px; color: var(--text3); }
+.pm-sl .pm-val  { color: var(--red); }
+.pm-tp1 .pm-val { color: var(--green); }
+.pm-tp2 .pm-val { color: var(--cyan); }
+
+.brief-why { background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
+.brief-why-title { font-family: var(--font-mono); font-size: 9px; color: var(--text3); letter-spacing: 2px; margin-bottom: 6px; }
+.brief-why-item { font-family: var(--font-mono); font-size: 10px; color: var(--text2); padding: 3px 0; line-height: 1.6; display: flex; gap: 6px; }
+.why-dot { flex-shrink: 0; }
+
+.brief-actions-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.brief-btn { flex: 1; }
+.brief-rr-pill {
+  font-family: var(--font-mono); font-size: 9px;
+  color: var(--cyan); background: rgba(0,188,212,0.1);
+  border: 1px solid rgba(0,188,212,0.25);
+  padding: 6px 10px; border-radius: 4px; white-space: nowrap;
 }
-.brief-why-item {
+
+/* ── RISK GAUGE HINT ────────────────────────────────── */
+.risk-gauge-hint {
   font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text2);
-  padding: 3px 0;
-  line-height: 1.6;
+  font-size: 8px;
+  color: var(--text4);
+  padding: 4px 0 2px 2px;
+  letter-spacing: 0.3px;
+  line-height: 1.5;
 }
-.brief-wait-label {
-  font-family: var(--font-title);
-  font-size: 22px;
-  color: var(--amber);
-  letter-spacing: 3px;
-  margin-bottom: 8px;
+
+/* ── PAPER TRADING TRACKER ──────────────────────────── */
+.paper-kpis {
+  display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px;
 }
-.brief-wait-sub { font-family: var(--font-mono); font-size: 10px; color: var(--text3); line-height: 1.6; }
+.paper-kpi {
+  flex: 1; min-width: 60px;
+  background: var(--bg4); border: 1px solid var(--border);
+  border-radius: 6px; padding: 10px 12px; text-align: center;
+}
+.pk-val { font-family: var(--font-title); font-size: 26px; line-height: 1; }
+.pk-lbl { font-family: var(--font-mono); font-size: 8px; color: var(--text3); letter-spacing: 1px; margin-top: 2px; }
+
+.paper-row {
+  display: grid;
+  grid-template-columns: 60px 90px 70px 80px 80px 80px 50px 80px;
+  gap: 6px; align-items: center;
+  padding: 7px 8px;
+  font-family: var(--font-mono); font-size: 9px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.paper-row:hover { background: var(--bg3); }
+.paper-header { color: var(--text3); font-size: 8px; letter-spacing: 1px; cursor: default; }
+.paper-header:hover { background: none; }
 
 /* ── MORNING BRIEF (Dashboard) ──────────────────────── */
 .morning-brief-wrap {

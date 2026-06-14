@@ -12,7 +12,8 @@ let scanMarket = "both";
 let euSectorFilter = "ALL";
 let usSectorFilter = "ALL";
 const CURR_SYMS = {"USD":"$","EUR":"€","GBP":"p","JPY":"¥","HKD":"HK$","INR":"₹","KRW":"₩","CHF":"Fr","DKK":"kr","SEK":"kr","NGN":"₦"};
-let trades = JSON.parse(localStorage.getItem("sn_trades") || "[]");
+let trades      = JSON.parse(localStorage.getItem("sn_trades")  || "[]");
+let paperTrades = JSON.parse(localStorage.getItem("sn_paper")   || "[]");
 
 // ── FORMAT HELPERS ─────────────────────────────────────────────
 function fp(v, currency = "USD") {
@@ -168,6 +169,7 @@ function handleTick(msg) {
   updatePredHeaderPrice(id, price, change);
   if (currentPage === "dashboard") updateDashKPIs();
   updateHeatCell(id, change);
+  checkPaperTrades(id, price);
 }
 
 function flashCell(id, dir) {
@@ -530,66 +532,92 @@ function updatePredHeaderPrice(id, price, change) {
 }
 
 // ── TRADE BRIEF CARD ───────────────────────────────────
+function renderProfitMeter(brief, sym) {
+  if (!brief || brief.action === "WAIT") return "";
+  const isLong = brief.action === "LONG";
+  // Normalize widths: SL distance vs TP2 distance
+  const totalRange = brief.slPct + brief.tp2Pct;
+  const slW  = Math.max(8, (brief.slPct  / totalRange * 100)).toFixed(1);
+  const tp1W = Math.max(8, (brief.tp1Pct / totalRange * 100)).toFixed(1);
+  const tp2W = Math.max(8, ((brief.tp2Pct - brief.tp1Pct) / totalRange * 100)).toFixed(1);
+
+  return `
+  <div class="profit-meter">
+    <div class="pm-sl" style="flex:${slW}">
+      <div class="pm-label">SL</div>
+      <div class="pm-val">${sym}${fpRaw(brief.stop)}</div>
+      <div class="pm-pct">−${brief.slPct}%</div>
+    </div>
+    <div class="pm-entry">
+      <div class="pm-entry-dot"></div>
+      <div class="pm-entry-label">ENTRY<br/>${sym}${fpRaw(brief.entry)}</div>
+    </div>
+    <div class="pm-tp1" style="flex:${tp1W}">
+      <div class="pm-label">TP1</div>
+      <div class="pm-val">${sym}${fpRaw(brief.tp1)}</div>
+      <div class="pm-pct">+${brief.tp1Pct}% · ${brief.rr1}:1</div>
+    </div>
+    <div class="pm-tp2" style="flex:${tp2W}">
+      <div class="pm-label">TP2</div>
+      <div class="pm-val">${sym}${fpRaw(brief.tp2)}</div>
+      <div class="pm-pct">+${brief.tp2Pct}% · ${brief.rr2}:1</div>
+    </div>
+  </div>`;
+}
+
 function renderTradeBrief(brief, sym, stockId, market) {
   if (!brief || brief.action === "WAIT") {
     return `<div class="trade-brief brief-wait">
       <div class="brief-wait-label">— WAIT —</div>
-      <div class="brief-wait-sub">No high-confidence setup detected right now.<br/>
-      Indicators are mixed or trend is too weak. Check back after next tick.</div>
+      <div class="brief-wait-sub">No high-confidence setup. Indicators are mixed or trend too weak.<br/>
+      The auto-scanner will flag it when conditions align.</div>
     </div>`;
   }
   const isLong = brief.action === "LONG";
   const c      = isLong ? "var(--green)" : "var(--red)";
   const sign   = isLong ? "+" : "−";
-  const why    = (brief.why || []).map(w => `<div class="brief-why-item">▸ ${w}</div>`).join("");
+  const why    = (brief.why || []).map(w =>
+    `<div class="brief-why-item"><span class="why-dot" style="color:${c}">▸</span> ${w}</div>`
+  ).join("");
+
+  // Confidence gauge segments
+  const conf = brief.confidence;
+  const gColor = conf >= 70 ? "var(--green)" : conf >= 55 ? "var(--amber)" : "var(--red)";
 
   return `
   <div class="trade-brief ${isLong ? "brief-long" : "brief-short"}">
-    <div class="brief-top">
-      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <span class="brief-action-badge" style="background:${c}22;color:${c};border:1px solid ${c}44">${brief.action}</span>
-        <span style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${brief.dataSource==="real_candles"?"✓ REAL CANDLE DATA":"⚡ APPROXIMATED DATA"}</span>
-      </div>
-      <div style="text-align:right;flex-shrink:0">
-        <div style="font-family:var(--font-mono);font-size:8px;color:var(--text3)">CONFIDENCE</div>
-        <div style="font-family:var(--font-title);font-size:26px;color:${c};line-height:1">${brief.confidence}%</div>
-      </div>
-    </div>
-    <div class="brief-conf-bar"><div style="width:${brief.confidence}%;background:${c};height:100%;border-radius:2px;transition:width .4s"></div></div>
 
-    <div class="brief-levels-grid">
-      <div class="brief-level-card">
-        <div class="blc-label">ENTRY</div>
-        <div class="blc-price">${sym}${fpRaw(brief.entry)}</div>
-        <div class="blc-pct" style="color:var(--text3)">market price</div>
+    <!-- Header row: action + confidence -->
+    <div class="brief-header-row">
+      <div>
+        <span class="brief-action-badge" style="background:${c}22;color:${c};border:1px solid ${c}55">${brief.action}</span>
+        <span class="brief-data-src">${brief.dataSource==="real_candles"?"✓ REAL DATA":"⚡ APPROX"}</span>
       </div>
-      <div class="brief-level-card">
-        <div class="blc-label">STOP LOSS</div>
-        <div class="blc-price" style="color:var(--red)">${sym}${fpRaw(brief.stop)}</div>
-        <div class="blc-pct" style="color:var(--red)">−${brief.slPct}% risk</div>
-      </div>
-      <div class="brief-level-card">
-        <div class="blc-label">TARGET 1</div>
-        <div class="blc-price" style="color:var(--green)">${sym}${fpRaw(brief.tp1)}</div>
-        <div class="blc-pct" style="color:var(--green)">${sign}${brief.tp1Pct}% · R:R ${brief.rr1}:1</div>
-      </div>
-      <div class="brief-level-card">
-        <div class="blc-label">TARGET 2</div>
-        <div class="blc-price" style="color:var(--cyan)">${sym}${fpRaw(brief.tp2)}</div>
-        <div class="blc-pct" style="color:var(--cyan)">${sign}${brief.tp2Pct}% · R:R ${brief.rr2}:1</div>
+      <div class="brief-conf-wrap">
+        <div class="brief-conf-num" style="color:${gColor}">${conf}%</div>
+        <div class="brief-conf-lbl">CONFIDENCE</div>
+        <div class="brief-conf-track">
+          <div class="brief-conf-fill" style="width:${conf}%;background:${gColor}"></div>
+        </div>
       </div>
     </div>
 
+    <!-- Visual profit meter -->
+    ${renderProfitMeter(brief, sym)}
+
+    <!-- Why bullets -->
     ${why ? `<div class="brief-why">
-      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:6px">WHY THIS SIGNAL</div>
+      <div class="brief-why-title">WHY THIS SIGNAL</div>
       ${why}
     </div>` : ""}
 
-    <div style="display:flex;gap:8px;margin-top:10px">
-      <button class="btn-primary" style="flex:1;background:${c}22;border:1px solid ${c}44;color:${c}"
+    <!-- Actions -->
+    <div class="brief-actions-row">
+      <button class="btn-primary brief-btn" style="background:${c}22;border-color:${c}44;color:${c}"
         onclick="prefillJournal('${stockId}','${market}','${brief.action}','${brief.entry}','${brief.stop}','${brief.tp1}','${brief.tp2}')">
-        + ADD ${brief.action} TO JOURNAL
+        + LOG ${brief.action} TO JOURNAL
       </button>
+      <div class="brief-rr-pill">R:R ${brief.rr1}:1 → ${brief.rr2}:1</div>
     </div>
   </div>`;
 }
@@ -884,6 +912,127 @@ function renderAnalysisResult(d, balance, riskPct) {
   </div>`;
 }
 
+// ── AUTO PAPER TRADING ─────────────────────────────────
+function autoPaperTrade(results) {
+  // Only auto-log strong signals (conf >= 65%) that have TP/SL data
+  const strong = results.filter(r => r.conf >= 65 && r.t1 && r.stop);
+  let added = 0;
+  for (const r of strong) {
+    // Don't double-log the same stock if already open
+    if (paperTrades.find(p => p.id === r.id && p.status === "OPEN")) continue;
+    paperTrades.push({
+      id: r.id, name: r.name, market: r.market,
+      currency: r.currency, color: r.color,
+      direction: r.direction, conf: r.conf,
+      entry: r.price, stop: r.stop, tp1: r.t1, tp2: r.t2, rr: r.rr,
+      time: new Date().toISOString(),
+      status: "OPEN", result: null, exitPrice: null, exitTime: null,
+    });
+    added++;
+  }
+  if (added) {
+    localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
+    renderPaperStats();
+    // Update journal tab badge
+    const jNav = document.querySelector('.nav-item[data-page="journal"]');
+    if (jNav) {
+      const open = paperTrades.filter(p => p.status === "OPEN").length;
+      jNav.querySelector("span:last-child").textContent = `TRADE ${open > 0 ? "(" + open + ")" : ""}`;
+    }
+  }
+}
+
+function checkPaperTrades(stockId, price) {
+  let changed = false;
+  for (const t of paperTrades) {
+    if (t.id !== stockId || t.status !== "OPEN") continue;
+    const isLong = t.direction === "BULLISH";
+    const hitTP  = isLong ? price >= t.tp1 : price <= t.tp1;
+    const hitSL  = isLong ? price <= t.stop : price >= t.stop;
+    if (hitTP || hitSL) {
+      t.status    = "CLOSED";
+      t.result    = hitTP ? "WIN" : "LOSS";
+      t.exitPrice = hitTP ? t.tp1 : t.stop;
+      t.exitTime  = new Date().toISOString();
+      changed = true;
+    }
+  }
+  if (changed) {
+    localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
+    if (currentPage === "journal") renderPaperStats();
+  }
+}
+
+function renderPaperStats() {
+  const el = document.getElementById("paper-stats");
+  if (!el) return;
+  const closed = paperTrades.filter(t => t.status === "CLOSED");
+  const open   = paperTrades.filter(t => t.status === "OPEN");
+  const wins   = closed.filter(t => t.result === "WIN").length;
+  const losses = closed.filter(t => t.result === "LOSS").length;
+  const acc    = closed.length ? Math.round(wins / closed.length * 100) : null;
+  const accColor = acc === null ? "var(--text3)" : acc >= 55 ? "var(--green)" : acc >= 45 ? "var(--amber)" : "var(--red)";
+
+  const rowHtml = (trades, showStatus) => trades.slice(0,8).map(t => {
+    const sym = currSym(t.currency || "USD");
+    const isLong = t.direction === "BULLISH";
+    const dc = isLong ? "var(--green)" : "var(--red)";
+    const flag = t.market==="eu"?"🌍":t.market==="as"?"🌏":"🇺🇸";
+    const pnl = t.exitPrice ? ((isLong ? t.exitPrice - t.entry : t.entry - t.exitPrice) / t.entry * 100).toFixed(2) : null;
+    return `<div class="paper-row" onclick="quickSelect('${t.id}','${t.market}')">
+      <div style="color:var(--text2)">${new Date(t.time).toLocaleDateString("en",{month:"short",day:"numeric"})}</div>
+      <div style="font-weight:700;color:${t.color||dc}">${flag} ${t.id}</div>
+      <div style="color:${dc}">${isLong?"▲ LONG":"▼ SHORT"}</div>
+      <div style="font-family:var(--font-mono);font-size:9px">${sym}${fpRaw(t.entry)}</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--red)">${sym}${fpRaw(t.stop)}</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--green)">${sym}${fpRaw(t.tp1)}</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--cyan)">${t.rr}:1</div>
+      <div style="font-weight:700;color:${t.result==="WIN"?"var(--green)":t.result==="LOSS"?"var(--red)":"var(--amber)"}">
+        ${t.result || "OPEN"}${pnl ? " " + (pnl>0?"+":"") + pnl + "%" : ""}
+      </div>
+    </div>`;
+  }).join("");
+
+  el.innerHTML = `
+  <div class="section-title" style="margin-bottom:14px">
+    AUTO PAPER TRADING — ACCURACY TRACKER
+    <button class="btn-secondary" style="float:right;font-size:9px;padding:2px 8px" onclick="clearPaperTrades()">RESET</button>
+  </div>
+  <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-bottom:12px">
+    Strong signals (≥65% confidence) are auto-logged here. Wins = TP1 hit. Losses = SL hit.
+  </div>
+  <div class="paper-kpis">
+    <div class="paper-kpi"><div class="pk-val" style="color:var(--cyan)">${open.length}</div><div class="pk-lbl">OPEN</div></div>
+    <div class="paper-kpi"><div class="pk-val">${closed.length}</div><div class="pk-lbl">CLOSED</div></div>
+    <div class="paper-kpi"><div class="pk-val" style="color:var(--green)">${wins}</div><div class="pk-lbl">WINS</div></div>
+    <div class="paper-kpi"><div class="pk-val" style="color:var(--red)">${losses}</div><div class="pk-lbl">LOSSES</div></div>
+    <div class="paper-kpi"><div class="pk-val" style="color:${accColor}">${acc !== null ? acc + "%" : "—"}</div><div class="pk-lbl">ACCURACY</div></div>
+  </div>
+  ${open.length ? `
+  <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin:14px 0 6px">OPEN POSITIONS</div>
+  <div class="paper-header paper-row">
+    <span>DATE</span><span>STOCK</span><span>DIR</span><span>ENTRY</span><span>SL</span><span>TP1</span><span>R:R</span><span>STATUS</span>
+  </div>
+  ${rowHtml(open, true)}` : ""}
+  ${closed.length ? `
+  <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin:14px 0 6px">CLOSED TRADES</div>
+  <div class="paper-header paper-row">
+    <span>DATE</span><span>STOCK</span><span>DIR</span><span>ENTRY</span><span>SL</span><span>TP1</span><span>R:R</span><span>RESULT</span>
+  </div>
+  ${rowHtml(closed.reverse(), false)}` : ""}
+  ${!open.length && !closed.length ? `
+  <div class="empty-state" style="padding:24px 0">
+    <div class="empty-sub">No paper trades yet.<br/>Auto-logs when a scan finds a signal ≥65% confidence.</div>
+  </div>` : ""}`;
+}
+
+function clearPaperTrades() {
+  if (!confirm("Reset all paper trade data?")) return;
+  paperTrades = [];
+  localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
+  renderPaperStats();
+}
+
 // ── MORNING BRIEF ──────────────────────────────────────
 async function loadMorningBrief() {
   try {
@@ -977,6 +1126,7 @@ async function runScan(silent = false) {
     });
     const data = await res.json();
     renderScanResults(data, silent);
+    autoPaperTrade(data.results || []);
   } catch(e) {
     if (!silent) document.getElementById("scanner-content").innerHTML =
       `<div style="color:var(--red);font-family:var(--font-mono);font-size:10px;padding:20px">ERROR: ${e.message}</div>`;
@@ -1291,6 +1441,7 @@ function calcPnL(t) {
 function round2(v) { return Math.round(v * 100) / 100; }
 
 function renderJournal() {
+  renderPaperStats();
   const open   = trades.filter(t => t.status === "OPEN");
   const closed = trades.filter(t => t.status === "CLOSED");
 

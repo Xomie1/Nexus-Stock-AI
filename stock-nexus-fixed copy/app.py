@@ -1407,11 +1407,20 @@ def scan():
                 "adx": min(80, max(10, abs(change)*8+20)),
             }
             direction, conf, bp = rule_based_signal(ind, change)
-            # Consensus filter — only include if rule-based signal is clear
-            # (ML not run here for speed; full ML consensus available via /api/analyze)
             if direction != "NEUTRAL" and conf >= 55:
                 consensus = _build_consensus(direction, conf, bp,
                                              {"ml_source": "unavailable", "ml_direction": None})
+                # ATR-based TP/SL for paper trade auto-execution
+                atr_m = rng * 0.015 / (price + 1e-9)
+                if direction == "BULLISH":
+                    t1   = round(price * (1 + atr_m * 1.5), 2)
+                    t2   = round(price * (1 + atr_m * 3.0), 2)
+                    stop = round(price * (1 - atr_m * 1.0), 2)
+                else:
+                    t1   = round(price * (1 - atr_m * 1.5), 2)
+                    t2   = round(price * (1 - atr_m * 3.0), 2)
+                    stop = round(price * (1 + atr_m * 1.0), 2)
+                rr = round(abs(t1 - price) / (abs(price - stop) + 1e-9), 2)
                 results.append({
                     "id": s["id"], "name": s["name"], "sector": s["sector"],
                     "market": mkt_type, "currency": s["currency"], "color": s["color"],
@@ -1419,6 +1428,7 @@ def scan():
                     "direction": direction, "conf": conf, "bullPct": bp,
                     "rsi": round(ind["rsi"], 1), "adx": round(ind["adx"], 1),
                     "consensusSignal": consensus["signal"],
+                    "t1": t1, "t2": t2, "stop": stop, "rr": rr,
                 })
 
     if market_type in ("eu","both"): scan_list(EU_STOCKS,   market_eu, "eu")
