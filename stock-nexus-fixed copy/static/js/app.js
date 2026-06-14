@@ -71,6 +71,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     renderJournal();
     startSSE();
 
+    // Morning brief on dashboard
+    loadMorningBrief();
+    setInterval(loadMorningBrief, 10 * 60 * 1000);
+
     // Auto-scan: run 2s after load, then every 5 minutes
     setTimeout(() => runScan(true), 2000);
     setInterval(() => runScan(true), 5 * 60 * 1000);
@@ -525,6 +529,71 @@ function updatePredHeaderPrice(id, price, change) {
   if (chEl) { chEl.textContent = fPct(change); chEl.style.color = chColor(change); }
 }
 
+// ── TRADE BRIEF CARD ───────────────────────────────────
+function renderTradeBrief(brief, sym, stockId, market) {
+  if (!brief || brief.action === "WAIT") {
+    return `<div class="trade-brief brief-wait">
+      <div class="brief-wait-label">— WAIT —</div>
+      <div class="brief-wait-sub">No high-confidence setup detected right now.<br/>
+      Indicators are mixed or trend is too weak. Check back after next tick.</div>
+    </div>`;
+  }
+  const isLong = brief.action === "LONG";
+  const c      = isLong ? "var(--green)" : "var(--red)";
+  const sign   = isLong ? "+" : "−";
+  const why    = (brief.why || []).map(w => `<div class="brief-why-item">▸ ${w}</div>`).join("");
+
+  return `
+  <div class="trade-brief ${isLong ? "brief-long" : "brief-short"}">
+    <div class="brief-top">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <span class="brief-action-badge" style="background:${c}22;color:${c};border:1px solid ${c}44">${brief.action}</span>
+        <span style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${brief.dataSource==="real_candles"?"✓ REAL CANDLE DATA":"⚡ APPROXIMATED DATA"}</span>
+      </div>
+      <div style="text-align:right;flex-shrink:0">
+        <div style="font-family:var(--font-mono);font-size:8px;color:var(--text3)">CONFIDENCE</div>
+        <div style="font-family:var(--font-title);font-size:26px;color:${c};line-height:1">${brief.confidence}%</div>
+      </div>
+    </div>
+    <div class="brief-conf-bar"><div style="width:${brief.confidence}%;background:${c};height:100%;border-radius:2px;transition:width .4s"></div></div>
+
+    <div class="brief-levels-grid">
+      <div class="brief-level-card">
+        <div class="blc-label">ENTRY</div>
+        <div class="blc-price">${sym}${fpRaw(brief.entry)}</div>
+        <div class="blc-pct" style="color:var(--text3)">market price</div>
+      </div>
+      <div class="brief-level-card">
+        <div class="blc-label">STOP LOSS</div>
+        <div class="blc-price" style="color:var(--red)">${sym}${fpRaw(brief.stop)}</div>
+        <div class="blc-pct" style="color:var(--red)">−${brief.slPct}% risk</div>
+      </div>
+      <div class="brief-level-card">
+        <div class="blc-label">TARGET 1</div>
+        <div class="blc-price" style="color:var(--green)">${sym}${fpRaw(brief.tp1)}</div>
+        <div class="blc-pct" style="color:var(--green)">${sign}${brief.tp1Pct}% · R:R ${brief.rr1}:1</div>
+      </div>
+      <div class="brief-level-card">
+        <div class="blc-label">TARGET 2</div>
+        <div class="blc-price" style="color:var(--cyan)">${sym}${fpRaw(brief.tp2)}</div>
+        <div class="blc-pct" style="color:var(--cyan)">${sign}${brief.tp2Pct}% · R:R ${brief.rr2}:1</div>
+      </div>
+    </div>
+
+    ${why ? `<div class="brief-why">
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:6px">WHY THIS SIGNAL</div>
+      ${why}
+    </div>` : ""}
+
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button class="btn-primary" style="flex:1;background:${c}22;border:1px solid ${c}44;color:${c}"
+        onclick="prefillJournal('${stockId}','${market}','${brief.action}','${brief.entry}','${brief.stop}','${brief.tp1}','${brief.tp2}')">
+        + ADD ${brief.action} TO JOURNAL
+      </button>
+    </div>
+  </div>`;
+}
+
 // ── ANALYSIS ──────────────────────────────────────────────────
 async function runAnalysis() {
   if (!selectedStock) {
@@ -615,6 +684,10 @@ function renderAnalysisResult(d, balance, riskPct) {
 
   document.getElementById("pred-content").innerHTML = `
   <div class="fadeIn">
+
+    <!-- TRADE BRIEF CARD — primary action signal -->
+    ${renderTradeBrief(d.tradeBrief, sym, d.stockId, predMarket)}
+
     <!-- SIGNAL BOX -->
     <div class="signal-box ${sigCls}" style="margin-bottom:16px">
       <div class="signal-dir" style="color:${sigColor}">${dir}</div>
@@ -811,6 +884,77 @@ function renderAnalysisResult(d, balance, riskPct) {
   </div>`;
 }
 
+// ── MORNING BRIEF ──────────────────────────────────────
+async function loadMorningBrief() {
+  try {
+    const res  = await fetch("/api/brief");
+    const data = await res.json();
+    renderMorningBrief(data);
+  } catch(e) { /* silent */ }
+}
+
+function renderMorningBrief(data) {
+  const el = document.getElementById("morning-brief");
+  if (!el) return;
+  const longs  = data.longs  || [];
+  const shorts = data.shorts || [];
+  if (!longs.length && !shorts.length) { el.innerHTML = ""; return; }
+
+  const moodColor = data.bullPct > 55 ? "var(--green)" : data.bullPct < 45 ? "var(--red)" : "var(--amber)";
+
+  function miniCard(s, dir) {
+    const sym = currSym(s.currency || "USD");
+    const c   = dir === "LONG" ? "var(--green)" : "var(--red)";
+    const flag = s.market==="eu" ? "🌍" : s.market==="as" ? "🌏" : "🇺🇸";
+    return `
+    <div class="brief-mini-card" onclick="quickSelect('${s.id}','${s.market}')">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+        <div>
+          <span style="font-family:var(--font-main);font-size:13px;font-weight:700;color:${s.color||c}">${flag} ${s.id}</span>
+          <span style="font-family:var(--font-mono);font-size:8px;color:var(--text3);margin-left:6px">${s.sector}</span>
+        </div>
+        <span style="font-family:var(--font-mono);font-size:9px;font-weight:700;color:${c};background:${c}22;padding:2px 8px;border-radius:3px">${dir} ${s.conf}%</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+        <span style="font-family:var(--font-title);font-size:18px;color:${chColor(s.change)}">${sym}${fpRaw(s.price)}</span>
+        <span style="font-family:var(--font-mono);font-size:9px;color:${chColor(s.change)}">${fPct(s.change)}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;font-family:var(--font-mono);font-size:8px;color:var(--text3)">
+        <div>SL<br/><span style="color:var(--red)">${sym}${fpRaw(s.stop)}</span></div>
+        <div>TP1<br/><span style="color:var(--green)">${sym}${fpRaw(s.t1)}</span></div>
+        <div>TP2<br/><span style="color:var(--cyan)">${sym}${fpRaw(s.t2)}</span></div>
+        <div>R:R<br/><span style="color:var(--cyan)">${s.rr}:1</span></div>
+      </div>
+      <div class="conf-bar-wrap" style="margin-top:6px"><div class="conf-bar" style="width:${s.conf}%;background:${c}"></div></div>
+    </div>`;
+  }
+
+  el.innerHTML = `
+  <div class="morning-brief-wrap">
+    <div class="morning-brief-header">
+      <div>
+        <div style="font-family:var(--font-title);font-size:16px;letter-spacing:2px">TODAY'S SIGNALS</div>
+        <div style="font-family:var(--font-mono);font-size:8px;color:var(--text3);margin-top:2px">${data.date} · ${data.time} · ${data.totalSignals} setups found</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-family:var(--font-mono);font-size:8px;color:var(--text3)">MARKET MOOD</div>
+        <div style="font-family:var(--font-mono);font-size:12px;font-weight:700;color:${moodColor}">${data.marketMood}</div>
+        <div style="font-family:var(--font-mono);font-size:8px;color:var(--text3)">${data.bullPct}% BULLISH BIAS</div>
+      </div>
+    </div>
+    <div class="morning-brief-cols">
+      <div>
+        <div style="font-family:var(--font-mono);font-size:9px;color:var(--green);letter-spacing:2px;margin-bottom:8px">▲ LONG SETUPS (${longs.length})</div>
+        ${longs.map(s => miniCard(s,"LONG")).join("") || '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text4);padding:10px 0">No bullish setups right now</div>'}
+      </div>
+      <div>
+        <div style="font-family:var(--font-mono);font-size:9px;color:var(--red);letter-spacing:2px;margin-bottom:8px">▼ SHORT SETUPS (${shorts.length})</div>
+        ${shorts.map(s => miniCard(s,"SHORT")).join("") || '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text4);padding:10px 0">No bearish setups right now</div>'}
+      </div>
+    </div>
+  </div>`;
+}
+
 // ── SCANNER ────────────────────────────────────────────────────
 function setScanMarket(mkt, btn) {
   scanMarket = mkt;
@@ -902,6 +1046,50 @@ function renderScanResults(data, silent = false) {
         </div>`;
       }).join("")}
     </div>`;
+
+  // Load signal history below scanner results
+  loadSignalHistory();
+}
+
+async function loadSignalHistory() {
+  try {
+    const res  = await fetch("/api/signal_history");
+    const data = await res.json();
+    renderSignalHistory(data.signals || []);
+  } catch(e) { /* silent */ }
+}
+
+function renderSignalHistory(signals) {
+  const el = document.getElementById("scanner-content");
+  if (!el || !signals.length) return;
+
+  const histHtml = `
+  <div class="sig-history-wrap">
+    <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:10px">
+      SIGNAL HISTORY — TRADEABLE SIGNALS THIS SESSION (${signals.length})
+    </div>
+    <div class="sig-history-row" style="color:var(--text3);border-bottom:1px solid var(--border2)">
+      <span>TIME</span><span>STOCK</span><span>NAME</span>
+      <span>DIR</span><span>ENTRY</span><span>SL</span><span>TP1</span><span>R:R</span>
+    </div>
+    ${signals.map(s => {
+      const c   = s.direction==="BULLISH"?"var(--green)":"var(--red)";
+      const sym = ""; // no currency info here — keep it clean
+      const mkt = s.market==="eu"?"🌍":s.market==="as"?"🌏":"🇺🇸";
+      return `<div class="sig-history-row" onclick="quickSelect('${s.id}','${s.market}')">
+        <span style="color:var(--text4)">${s.time}</span>
+        <span style="color:var(--text);font-weight:600">${mkt} ${s.id}</span>
+        <span style="color:var(--text3)">${s.name.slice(0,18)}</span>
+        <span style="color:${c};font-weight:700">${s.direction==="BULLISH"?"▲ LONG":"▼ SHORT"}</span>
+        <span>${fpRaw(s.entry)}</span>
+        <span style="color:var(--red)">${fpRaw(s.stop)}</span>
+        <span style="color:var(--green)">${fpRaw(s.tp1)}</span>
+        <span style="color:var(--cyan)">${s.rr}:1</span>
+      </div>`;
+    }).join("")}
+  </div>`;
+
+  el.innerHTML += histHtml;
 }
 
 // ── CHART VISION AI ────────────────────────────────────────────

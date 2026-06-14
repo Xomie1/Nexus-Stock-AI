@@ -460,6 +460,10 @@ market_eu = _init_market(EU_SEEDS,   EU_STOCKS,   {"price":100,"change":0,"high"
 market_as = _init_market(ASIA_SEEDS, ASIA_STOCKS, {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})
 market_us = _init_market(US_SEEDS,   US_STOCKS,   {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})
 
+# ── Signal history — in-memory, last 100 tradeable signals ────────────────────
+_signal_history      = []
+_signal_history_lock = threading.Lock()
+
 # ── Broadcast SSE ─────────────────────────────────────────────────────────────
 subscribers = []
 subscribers_lock = threading.Lock()
@@ -897,6 +901,93 @@ def stream():
                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 # ── Consensus engine ─────────────────────────────────────────────────────────
+def _build_why_bullets(indicators, direction, news_score, news_items, data_src):
+    """Return up to 5 human-readable bullets explaining a signal."""
+    bullets = []
+    rsi      = indicators.get("rsi", 50)
+    macd     = indicators.get("macd", "")
+    macd_h   = indicators.get("macd_hist", 0)
+    bb_pct   = indicators.get("bb_pct", 50)
+    stoch_k  = indicators.get("stoch_k", 50)
+    adx      = indicators.get("adx", 20)
+    vol_r    = indicators.get("vol_ratio", 1.0)
+    candle   = indicators.get("candle", "")
+    ema9     = indicators.get("ema9", 0)
+    ema50    = indicators.get("ema50", 0)
+
+    if direction == "BULLISH":
+        if rsi < 35:   bullets.append(f"RSI oversold at {rsi:.0f} — recovery expected")
+        elif rsi < 50: bullets.append(f"RSI at {rsi:.0f} — room to move higher")
+        if macd == "BULLISH":
+            bullets.append(f"MACD bullish cross (hist {'+' if macd_h>=0 else ''}{macd_h:.4f})")
+        if bb_pct < 25:
+            bullets.append(f"Price near lower Bollinger Band ({bb_pct:.0f}%) — mean-reversion setup")
+        if stoch_k < 25:
+            bullets.append(f"Stochastic oversold at {stoch_k:.0f} — bounce likely")
+        if ema9 > ema50 > 0:
+            bullets.append("EMA 9 above EMA 50 — short-term uptrend confirmed")
+        if vol_r > 1.5:
+            bullets.append(f"Volume {vol_r:.1f}× avg — institutional buying detected")
+        if candle in ("HAMMER", "BULLISH BAR"):
+            bullets.append(f"Candle pattern: {candle}")
+    elif direction == "BEARISH":
+        if rsi > 65:   bullets.append(f"RSI overbought at {rsi:.0f} — pullback expected")
+        elif rsi > 50: bullets.append(f"RSI at {rsi:.0f} — momentum fading")
+        if macd == "BEARISH":
+            bullets.append(f"MACD bearish cross (hist {'+' if macd_h>=0 else ''}{macd_h:.4f})")
+        if bb_pct > 75:
+            bullets.append(f"Price near upper Bollinger Band ({bb_pct:.0f}%) — reversal zone")
+        if stoch_k > 75:
+            bullets.append(f"Stochastic overbought at {stoch_k:.0f} — sell pressure building")
+        if ema9 < ema50 and ema50 > 0:
+            bullets.append("EMA 9 below EMA 50 — downtrend in force")
+        if vol_r > 1.5:
+            bullets.append(f"Volume {vol_r:.1f}× avg — distribution selling")
+        if candle in ("SHOOTING STAR", "BEARISH BAR", "DOJI"):
+            bullets.append(f"Candle pattern: {candle}")
+
+    if adx > 40:   bullets.append(f"ADX {adx:.0f} — strong trending environment")
+    elif adx < 18: bullets.append(f"ADX {adx:.0f} — weak trend, trade with caution")
+
+    n_bull = sum(1 for it in news_items if it.get("score", 0) > 0.5)
+    n_bear = sum(1 for it in news_items if it.get("score", 0) < -0.5)
+    if n_bull > 0 and direction == "BULLISH":
+        bullets.append(f"News: {n_bull} bullish headline{'s' if n_bull>1 else ''} (avg score {news_score:+.1f})")
+    elif n_bear > 0 and direction == "BEARISH":
+        bullets.append(f"News: {n_bear} bearish headline{'s' if n_bear>1 else ''} (avg score {news_score:+.1f})")
+
+    if data_src == "real_candles":
+        bullets.append("Analysis based on real OHLCV candle data")
+    else:
+        bullets.append("Approximated from current price/change (real candle data unavailable)")
+
+    return bullets[:5]
+
+
+def _build_trade_brief(direction, conf, price, t1, t2, stop, rr,
+                       indicators, news_score, news_items, data_src):
+    action   = "LONG" if direction == "BULLISH" else ("SHORT" if direction == "BEARISH" else "WAIT")
+    why      = _build_why_bullets(indicators, direction, news_score, news_items, data_src)
+    sl_dist  = abs(price - stop)
+    tp1_dist = abs(t1 - price)
+    tp2_dist = abs(t2 - price)
+    return {
+        "action":    action,
+        "entry":     price,
+        "stop":      stop,
+        "tp1":       t1,
+        "tp2":       t2,
+        "slPct":     round(sl_dist  / price * 100, 2) if price else 0,
+        "tp1Pct":    round(tp1_dist / price * 100, 2) if price else 0,
+        "tp2Pct":    round(tp2_dist / price * 100, 2) if price else 0,
+        "rr1":       rr,
+        "rr2":       round(tp2_dist / (sl_dist + 1e-9), 2),
+        "confidence": conf,
+        "why":       why,
+        "dataSource": data_src,
+    }
+
+
 def _build_consensus(rule_dir, rule_conf, bp, ml_pred):
     """
     Returns a consensus signal only when rule-based and ML agree on direction.
@@ -1125,6 +1216,22 @@ def analyze():
         # ── Consensus engine — only fire when ALL systems agree ───────────
         consensus = _build_consensus(direction, conf, bp, ml_pred)
 
+        # ── Trade brief — human-readable signal card ──────────────────────
+        trade_brief = _build_trade_brief(direction, conf, price, t1, t2, stop, rr,
+                                         indicators, news_score, news_items, data_src)
+
+        # ── Record to signal history when tradeable ───────────────────────
+        if consensus.get("tradeable"):
+            with _signal_history_lock:
+                _signal_history.append({
+                    "id": stock_id, "name": stock_info["name"],
+                    "market": market_type, "direction": direction, "conf": conf,
+                    "entry": price, "stop": stop, "tp1": t1, "tp2": t2, "rr": rr,
+                    "time": time.strftime("%d %b %H:%M", time.gmtime()),
+                })
+                if len(_signal_history) > 100:
+                    _signal_history.pop(0)
+
         return jsonify(_sanitize({
             "stockId": stock_id,
             "stockInfo": stock_info,
@@ -1145,6 +1252,7 @@ def analyze():
             "marketPhase": mkt_phase,
             "dataSource": data_src,
             "market": market_type,
+            "tradeBrief": trade_brief,
         }))
 
     except Exception as e:
@@ -1318,6 +1426,87 @@ def scan():
     if market_type in ("us","both"): scan_list(US_STOCKS,   market_us, "us")
     results.sort(key=lambda x: x["conf"], reverse=True)
     return jsonify({"results": results, "count": len(results)})
+
+
+@app.route("/api/brief")
+def brief():
+    """Daily signal briefing — top longs and shorts across all markets."""
+    longs, shorts = [], []
+
+    def _scan_for_brief(stock_list, mkt_data, mkt_type):
+        for s in stock_list:
+            state  = mkt_data.get(s["id"], {})
+            price  = float(state.get("price", 100))
+            change = float(state.get("change", 0))
+            high   = float(state.get("high", price * 1.02))
+            low    = float(state.get("low",  price * 0.98))
+            rng    = high - low or price * 0.02
+            ind = {
+                "rsi":    min(98, max(2, 50 + change * 4.2)),
+                "rsi_7":  min(98, max(2, 50 + change * 6)),
+                "macd":   "BULLISH" if change > 0 else "BEARISH",
+                "macd_hist": change * 0.001,
+                "bb_pct": ((price - low) / rng) * 100,
+                "stoch_k": ((price - low) / rng) * 100,
+                "adx":    min(80, max(10, abs(change) * 8 + 20)),
+                "vol_ratio": 1.0,
+                "candle": "BULLISH BAR" if change > 0 else "BEARISH BAR",
+                "ema9": price, "ema50": price,
+            }
+            direction, conf, bp = rule_based_signal(ind, change)
+            if direction == "NEUTRAL" or conf < 58:
+                continue
+            atr_m = rng * 0.015 / (price + 1e-9)
+            if direction == "BULLISH":
+                t1 = round(price * (1 + atr_m * 1.5), 2)
+                t2 = round(price * (1 + atr_m * 3.0), 2)
+                stop = round(price * (1 - atr_m * 1.0), 2)
+            else:
+                t1 = round(price * (1 - atr_m * 1.5), 2)
+                t2 = round(price * (1 - atr_m * 3.0), 2)
+                stop = round(price * (1 + atr_m * 1.0), 2)
+            rr = round(abs(t1 - price) / (abs(price - stop) + 1e-9), 2)
+            entry = {
+                "id": s["id"], "name": s["name"], "market": mkt_type,
+                "sector": s["sector"], "currency": s["currency"], "color": s["color"],
+                "price": price, "change": change, "direction": direction,
+                "conf": conf, "t1": t1, "t2": t2, "stop": stop, "rr": rr,
+            }
+            if direction == "BULLISH": longs.append(entry)
+            else: shorts.append(entry)
+
+    _scan_for_brief(EU_STOCKS,   market_eu, "eu")
+    _scan_for_brief(ASIA_STOCKS, market_as, "as")
+    _scan_for_brief(US_STOCKS,   market_us, "us")
+
+    longs.sort(key=lambda x: x["conf"],  reverse=True)
+    shorts.sort(key=lambda x: x["conf"], reverse=True)
+
+    total    = len(longs) + len(shorts)
+    bull_pct = round(len(longs) / total * 100) if total else 50
+    if bull_pct >= 70:   mood = "STRONGLY BULLISH"
+    elif bull_pct >= 55: mood = "CAUTIOUS BULLISH"
+    elif bull_pct <= 30: mood = "STRONGLY BEARISH"
+    elif bull_pct <= 45: mood = "CAUTIOUS BEARISH"
+    else:                mood = "NEUTRAL"
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    return jsonify(_sanitize({
+        "date": now.strftime("%d %b %Y"),
+        "time": now.strftime("%H:%M UTC"),
+        "longs":        longs[:4],
+        "shorts":       shorts[:4],
+        "totalSignals": total,
+        "marketMood":   mood,
+        "bullPct":      bull_pct,
+    }))
+
+
+@app.route("/api/signal_history")
+def signal_history_route():
+    with _signal_history_lock:
+        return jsonify({"signals": list(reversed(_signal_history[-50:]))})
 
 
 def _shutdown(signum=None, frame=None):
