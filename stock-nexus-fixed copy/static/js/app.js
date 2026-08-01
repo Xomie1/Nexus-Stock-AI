@@ -914,8 +914,13 @@ function renderAnalysisResult(d, balance, riskPct) {
 
 // ── AUTO PAPER TRADING ─────────────────────────────────
 function autoPaperTrade(results) {
-  // Only auto-log strong signals (conf >= 65%) that have TP/SL data
-  const strong = results.filter(r => r.conf >= 65 && r.t1 && r.stop);
+  // Only auto-log strong signals (conf >= 68%) with realistic TP/SL gaps
+  const strong = results.filter(r => {
+    if (r.conf < 68 || !r.t1 || !r.stop || !r.price) return false;
+    const tp1Gap = Math.abs(r.t1   - r.price) / r.price;  // need >= 1% to TP1
+    const slGap  = Math.abs(r.stop - r.price) / r.price;  // need >= 0.7% to SL
+    return tp1Gap >= 0.01 && slGap >= 0.007;
+  });
   let added = 0;
   for (const r of strong) {
     // Don't double-log the same stock if already open

@@ -753,22 +753,26 @@ def rule_based_signal(ind, ch):
     stoch = ind["stoch_k"]; adx = ind["adx"]
     if rsi < 30: b += 3
     elif rsi > 70: br += 3
-    elif rsi < 50: b += 1
-    else: br += 1
+    elif rsi < 45: b += 1          # slightly tighter neutral zone
+    elif rsi > 55: br += 1
     if macd == "BULLISH": b += 3
     else: br += 3
     if bb < 20: b += 2
     elif bb > 80: br += 2
     if stoch < 20: b += 2
     elif stoch > 80: br += 2
-    if ch > 1: b += 2
-    elif ch < -1: br += 2
+    if ch > 1.5: b += 2            # require stronger move for bonus
+    elif ch < -1.5: br += 2
+    elif ch > 0.5: b += 1
+    elif ch < -0.5: br += 1
     T = b + br
     bp = round(b / T * 100) if T else 50
-    direction = "BULLISH" if bp >= 60 else "BEARISH" if bp <= 40 else "NEUTRAL"
-    conf = round(min(88, max(20, abs(bp - 50) * 2.2)))
-    if adx < 18 and direction != "NEUTRAL" and conf < 55:
-        direction = "NEUTRAL"; conf = round(conf * 0.6)
+    direction = "BULLISH" if bp >= 62 else "BEARISH" if bp <= 38 else "NEUTRAL"
+    # Confidence: blend bull% with absolute change strength for spread
+    strength = min(10, abs(ch) * 3)
+    conf = round(min(82, max(20, abs(bp - 50) * 1.8 + strength)))
+    if adx < 22 and direction != "NEUTRAL":
+        direction = "NEUTRAL"; conf = round(conf * 0.55)
     return direction, conf, bp
 
 def swing_levels(df):
@@ -1139,31 +1143,27 @@ def analyze():
             cands = [x for x in swing_l if x <= thr]
             return cands[0] if cands else None
 
-        m = atr_raw / price
+        m = max(atr_raw / price, 0.008)  # floor at 0.8% to avoid noise-level stops
         if direction == "BULLISH":
-            t1   = round(nearest_above(1.0) or price*(1+m*1.5), 2)
-            t2   = round(nearest_above(2.0) or price*(1+m*3.0), 2)
-            # Ensure T2 is always further above price than T1
+            t1   = round(nearest_above(1.5) or price*(1+m*2.5), 2)
+            t2   = round(nearest_above(3.0) or price*(1+m*5.0), 2)
             if t2 <= t1:
-                t2 = round(t1 + atr_raw * 1.5, 2)
-            stop = round((nearest_below(0.8) or price*(1-m*1.0)) * 0.9985, 2)
-            # Ensure SL is actually below price
+                t2 = round(t1 + atr_raw * 2.5, 2)
+            stop = round((nearest_below(1.0) or price*(1-m*1.5)) * 0.9985, 2)
             if stop >= price:
-                stop = round(price * (1 - m * 1.0), 2)
+                stop = round(price * (1 - m * 1.5), 2)
         elif direction == "BEARISH":
-            t1   = round(nearest_below(1.0) or price*(1-m*1.5), 2)
-            t2   = round(nearest_below(2.0) or price*(1-m*3.0), 2)
-            # Ensure T2 is always further below price than T1
+            t1   = round(nearest_below(1.5) or price*(1-m*2.5), 2)
+            t2   = round(nearest_below(3.0) or price*(1-m*5.0), 2)
             if t2 >= t1:
-                t2 = round(t1 - atr_raw * 1.5, 2)
-            stop = round((nearest_above(0.8) or price*(1+m*1.0)) * 1.0015, 2)
-            # Ensure SL is actually above price
+                t2 = round(t1 - atr_raw * 2.5, 2)
+            stop = round((nearest_above(1.0) or price*(1+m*1.5)) * 1.0015, 2)
             if stop <= price:
-                stop = round(price * (1 + m * 1.0), 2)
+                stop = round(price * (1 + m * 1.5), 2)
         else:
-            t1   = round(price*(1+m*0.8), 2)
-            t2   = round(price*(1+m*1.5), 2)
-            stop = round(price*(1-m*1.2), 2)
+            t1   = round(price*(1+m*1.5), 2)
+            t2   = round(price*(1+m*3.0), 2)
+            stop = round(price*(1-m*1.5), 2)
 
         rr = round(abs(t1 - price) / (abs(price - stop) + 1e-6), 2)
 
@@ -1407,19 +1407,19 @@ def scan():
                 "adx": min(80, max(10, abs(change)*8+20)),
             }
             direction, conf, bp = rule_based_signal(ind, change)
-            if direction != "NEUTRAL" and conf >= 55:
+            if direction != "NEUTRAL" and conf >= 58:
                 consensus = _build_consensus(direction, conf, bp,
                                              {"ml_source": "unavailable", "ml_direction": None})
-                # ATR-based TP/SL for paper trade auto-execution
-                atr_m = rng * 0.015 / (price + 1e-9)
+                # ATR as fraction of price — floor at 1% to avoid noise-level stops
+                atr_m = max(rng / (price + 1e-9), 0.01)
                 if direction == "BULLISH":
-                    t1   = round(price * (1 + atr_m * 1.5), 2)
-                    t2   = round(price * (1 + atr_m * 3.0), 2)
-                    stop = round(price * (1 - atr_m * 1.0), 2)
+                    t1   = round(price * (1 + atr_m * 2.5), 2)
+                    t2   = round(price * (1 + atr_m * 5.0), 2)
+                    stop = round(price * (1 - atr_m * 1.5), 2)
                 else:
-                    t1   = round(price * (1 - atr_m * 1.5), 2)
-                    t2   = round(price * (1 - atr_m * 3.0), 2)
-                    stop = round(price * (1 + atr_m * 1.0), 2)
+                    t1   = round(price * (1 - atr_m * 2.5), 2)
+                    t2   = round(price * (1 - atr_m * 5.0), 2)
+                    stop = round(price * (1 + atr_m * 1.5), 2)
                 rr = round(abs(t1 - price) / (abs(price - stop) + 1e-9), 2)
                 results.append({
                     "id": s["id"], "name": s["name"], "sector": s["sector"],
@@ -1464,17 +1464,17 @@ def brief():
                 "ema9": price, "ema50": price,
             }
             direction, conf, bp = rule_based_signal(ind, change)
-            if direction == "NEUTRAL" or conf < 58:
+            if direction == "NEUTRAL" or conf < 60:
                 continue
-            atr_m = rng * 0.015 / (price + 1e-9)
+            atr_m = max(rng / (price + 1e-9), 0.01)
             if direction == "BULLISH":
-                t1 = round(price * (1 + atr_m * 1.5), 2)
-                t2 = round(price * (1 + atr_m * 3.0), 2)
-                stop = round(price * (1 - atr_m * 1.0), 2)
+                t1 = round(price * (1 + atr_m * 2.5), 2)
+                t2 = round(price * (1 + atr_m * 5.0), 2)
+                stop = round(price * (1 - atr_m * 1.5), 2)
             else:
-                t1 = round(price * (1 - atr_m * 1.5), 2)
-                t2 = round(price * (1 - atr_m * 3.0), 2)
-                stop = round(price * (1 + atr_m * 1.0), 2)
+                t1 = round(price * (1 - atr_m * 2.5), 2)
+                t2 = round(price * (1 - atr_m * 5.0), 2)
+                stop = round(price * (1 + atr_m * 1.5), 2)
             rr = round(abs(t1 - price) / (abs(price - stop) + 1e-9), 2)
             entry = {
                 "id": s["id"], "name": s["name"], "market": mkt_type,
