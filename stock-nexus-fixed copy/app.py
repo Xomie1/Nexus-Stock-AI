@@ -29,6 +29,7 @@ except ImportError:
         _ASYNC_SERVER = "werkzeug"
 
 import json, os, queue, random, threading, time, base64, sys
+import concurrent.futures
 import requests
 from flask import Flask, Response, render_template, jsonify, request, stream_with_context
 from flask_cors import CORS
@@ -64,7 +65,30 @@ except ImportError:
     def models_ready(): return False
 
 app = Flask(__name__)
-CORS(app)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB upload cap
+CORS(app, origins=["https://nexus-stock-ty2t.onrender.com", "http://localhost:5000", "http://127.0.0.1:5000"])
+
+# ── Thread pool for yfinance calls inside gevent request handlers ─────────────
+# gevent monkey-patches stdlib threads but NOT curl_cffi (used by yfinance).
+# Running yf.download() directly in a gevent greenlet causes "Cannot switch to
+# a different thread" errors. Offload to real OS threads via this executor.
+_yf_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="yf")
+
+# ── In-memory rate limiter — /api/analyze: max 6 calls per 60s per IP ────────
+_rate_buckets: dict = {}
+_rate_lock = threading.Lock()
+_RATE_MAX   = 6
+_RATE_WINDOW = 60.0
+
+def _rate_ok(ip: str) -> bool:
+    now = time.time()
+    with _rate_lock:
+        bucket = _rate_buckets.setdefault(ip, [])
+        _rate_buckets[ip] = [t for t in bucket if now - t < _RATE_WINDOW]
+        if len(_rate_buckets[ip]) >= _RATE_MAX:
+            return False
+        _rate_buckets[ip].append(now)
+        return True
 
 # ── Numpy JSON serialiser ─────────────────────────────────────────────────────
 def _sanitize(obj):
@@ -443,9 +467,15 @@ def _fetch_live_us_seeds():
     """Fetch current US prices from yfinance at startup to replace stale hardcoded seeds."""
     _fetch_yf_seeds(US_STOCKS, US_SEEDS, "US")
 
-_fetch_yf_seeds(EU_STOCKS, EU_SEEDS, "EU")
-_fetch_yf_seeds(ASIA_STOCKS, ASIA_SEEDS, "ASIA")
-_fetch_live_us_seeds()
+# Run all three seed fetches in parallel — sequential calls take 60-120s and
+# trigger Render's 30s request timeout on cold starts.
+_t_eu   = threading.Thread(target=lambda: _fetch_yf_seeds(EU_STOCKS,   EU_SEEDS,   "EU"),   daemon=True)
+_t_as   = threading.Thread(target=lambda: _fetch_yf_seeds(ASIA_STOCKS, ASIA_SEEDS, "ASIA"), daemon=True)
+_t_us   = threading.Thread(target=_fetch_live_us_seeds, daemon=True)
+for _t in (_t_eu, _t_as, _t_us): _t.start()
+_seed_deadline = time.monotonic() + 25   # shared 25s for all three, not 25s each
+for _t in (_t_eu, _t_as, _t_us):
+    _t.join(timeout=max(0.0, _seed_deadline - time.monotonic()))
 
 def _init_market(seeds, stocks, defaults):
     """Build market dict with open price stored for change% accumulation."""
@@ -463,6 +493,10 @@ market_us = _init_market(US_SEEDS,   US_STOCKS,   {"price":100,"change":0,"high"
 # ── Signal history — in-memory, last 100 tradeable signals ────────────────────
 _signal_history      = []
 _signal_history_lock = threading.Lock()
+
+# ── Backend paper trading — in-memory, no browser required ───────────────────
+_paper_trades = []   # list of trade dicts; survives as long as server is up
+_paper_lock   = threading.Lock()
 
 # ── Broadcast SSE ─────────────────────────────────────────────────────────────
 subscribers = []
@@ -561,23 +595,35 @@ def price_poll_thread():
                     _fail_count = 0
                     for stock_id, price in prices.items():
                         if stock_id in market_eu:
-                            seed_price = market_eu[stock_id].get("price") or price
-                            ch = round((price - seed_price) / (seed_price + 1e-9) * 100, 4)
-                            market_eu[stock_id]["price"] = price
-                            market_eu[stock_id]["change"] = ch
+                            mkt_slot = market_eu[stock_id]
+                            open_price = mkt_slot.get("open") or price
+                            ch = round((price - open_price) / (open_price + 1e-9) * 100, 4)
+                            mkt_slot["price"]  = price
+                            mkt_slot["change"] = ch
+                            mkt_slot["high"]   = max(mkt_slot.get("high", price), price)
+                            mkt_slot["low"]    = min(mkt_slot.get("low",  price), price)
                             broadcast({"type": "tick", "market": "eu", "id": stock_id, "price": price, "change": ch})
+                            _paper_check_exits(stock_id, price)
                         elif stock_id in market_as:
-                            seed_price = market_as[stock_id].get("price") or price
-                            ch = round((price - seed_price) / (seed_price + 1e-9) * 100, 4)
-                            market_as[stock_id]["price"] = price
-                            market_as[stock_id]["change"] = ch
+                            mkt_slot = market_as[stock_id]
+                            open_price = mkt_slot.get("open") or price
+                            ch = round((price - open_price) / (open_price + 1e-9) * 100, 4)
+                            mkt_slot["price"]  = price
+                            mkt_slot["change"] = ch
+                            mkt_slot["high"]   = max(mkt_slot.get("high", price), price)
+                            mkt_slot["low"]    = min(mkt_slot.get("low",  price), price)
                             broadcast({"type": "tick", "market": "as", "id": stock_id, "price": price, "change": ch})
+                            _paper_check_exits(stock_id, price)
                         elif stock_id in market_us:
-                            seed_price = market_us[stock_id].get("price") or price
-                            ch = round((price - seed_price) / (seed_price + 1e-9) * 100, 4)
-                            market_us[stock_id]["price"] = price
-                            market_us[stock_id]["change"] = ch
+                            mkt_slot = market_us[stock_id]
+                            open_price = mkt_slot.get("open") or price
+                            ch = round((price - open_price) / (open_price + 1e-9) * 100, 4)
+                            mkt_slot["price"]  = price
+                            mkt_slot["change"] = ch
+                            mkt_slot["high"]   = max(mkt_slot.get("high", price), price)
+                            mkt_slot["low"]    = min(mkt_slot.get("low",  price), price)
                             broadcast({"type": "tick", "market": "us", "id": stock_id, "price": price, "change": ch})
+                            _paper_check_exits(stock_id, price)
                     broadcast({"type": "status", "status": "live"})
                     time.sleep(15)
                     continue
@@ -599,34 +645,166 @@ def price_poll_thread():
             market_eu[s["id"]]["price"] = p
             market_eu[s["id"]]["change"] = ch
             broadcast({"type": "tick", "market": "eu", "id": s["id"], "price": p, "change": ch})
+            _paper_check_exits(s["id"], p)
         for s in ASIA_STOCKS:
             p, ch = simulate_tick_stock(s["id"], market_as[s["id"]], s["currency"])
             market_as[s["id"]]["price"] = p
             market_as[s["id"]]["change"] = ch
             broadcast({"type": "tick", "market": "as", "id": s["id"], "price": p, "change": ch})
+            _paper_check_exits(s["id"], p)
         for s in US_STOCKS:
             p, ch = simulate_tick_stock(s["id"], market_us[s["id"]], "USD")
             market_us[s["id"]]["price"] = p
             market_us[s["id"]]["change"] = ch
             broadcast({"type": "tick", "market": "us", "id": s["id"], "price": p, "change": ch})
+            _paper_check_exits(s["id"], p)
         broadcast({"type": "status", "status": "simulated"})
         time.sleep(15)
 
 threading.Thread(target=price_poll_thread, daemon=True).start()
 
+# ── Backend paper trading helpers ─────────────────────────────────────────────
+
+def _paper_log(stock_info, market, direction, conf, price, t1, t2, stop, rr):
+    """Log a paper trade if no open position already exists for this stock."""
+    with _paper_lock:
+        for t in _paper_trades:
+            if t["stock_id"] == stock_info["id"] and t["status"] == "OPEN":
+                return False
+        trade = {
+            "id":         f"{stock_info['id']}_{int(time.time())}",
+            "stock_id":   stock_info["id"],
+            "name":       stock_info["name"],
+            "market":     market,
+            "currency":   stock_info.get("currency", "USD"),
+            "color":      stock_info.get("color", "#22C55E"),
+            "direction":  direction,
+            "conf":       conf,
+            "entry":      round(float(price), 4),
+            "stop":       round(float(stop), 4),
+            "tp1":        round(float(t1), 4),
+            "tp2":        round(float(t2), 4),
+            "rr":         round(float(rr), 2),
+            "open_time":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "status":     "OPEN",
+            "result":     None,
+            "exit_price": None,
+            "close_time": None,
+        }
+        _paper_trades.append(trade)
+        if len(_paper_trades) > 500:
+            _paper_trades[:] = _paper_trades[-500:]
+        print(f"[PAPER] {direction} {stock_info['id']} @ {price:.4f}  TP1={t1:.4f}  SL={stop:.4f}  conf={conf}%")
+        broadcast({"type": "paper_trade_new", "trade": _sanitize(trade)})
+        return True
+
+
+def _paper_check_exits(stock_id, price):
+    """Called on every price tick — close trades that hit TP1 or SL."""
+    with _paper_lock:
+        for t in _paper_trades:
+            if t["stock_id"] != stock_id or t["status"] != "OPEN":
+                continue
+            is_long  = t["direction"] == "BULLISH"
+            hit_tp   = price >= t["tp1"] if is_long else price <= t["tp1"]
+            hit_sl   = price <= t["stop"] if is_long else price >= t["stop"]
+            if hit_tp or hit_sl:
+                t["status"]     = "CLOSED"
+                t["result"]     = "WIN" if hit_tp else "LOSS"
+                t["exit_price"] = round(float(t["tp1"] if hit_tp else t["stop"]), 4)
+                t["close_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                print(f"[PAPER] {'WIN ✓' if hit_tp else 'LOSS ✗'} {stock_id} exit @ {price:.4f}")
+                broadcast({"type": "paper_trade_closed", "trade": _sanitize(t)})
+
+
+def _paper_run_scan():
+    """Scan all markets, log strong signals as server-side paper trades."""
+    for stock_list, mkt_data, mkt_type in [
+        (EU_STOCKS,   market_eu, "eu"),
+        (ASIA_STOCKS, market_as, "as"),
+        (US_STOCKS,   market_us, "us"),
+    ]:
+        for s in stock_list:
+            try:
+                state  = mkt_data.get(s["id"], {})
+                price  = float(state.get("price", 100))
+                change = float(state.get("change", 0))
+                high   = float(state.get("high", price * 1.02))
+                low    = float(state.get("low",  price * 0.98))
+                rng    = high - low or price * 0.02
+                ind = {
+                    "rsi":     min(98, max(2, 50 + change * 4.2)),
+                    "macd":    "BULLISH" if change > 0 else "BEARISH",
+                    "bb_pct":  ((price - low) / rng) * 100,
+                    "stoch_k": ((price - low) / rng) * 100,
+                    "adx":     min(80, max(10, abs(change) * 8 + 20)),
+                }
+                direction, conf, _ = rule_based_signal(ind, change)
+                if direction == "NEUTRAL" or conf < 68:
+                    continue
+                atr_m = max(rng / (price + 1e-9), 0.01)
+                if direction == "BULLISH":
+                    t1   = round(price * (1 + atr_m * 2.5), 4)
+                    t2   = round(price * (1 + atr_m * 5.0), 4)
+                    stop = round(price * (1 - atr_m * 1.5), 4)
+                else:
+                    t1   = round(price * (1 - atr_m * 2.5), 4)
+                    t2   = round(price * (1 - atr_m * 5.0), 4)
+                    stop = round(price * (1 + atr_m * 1.5), 4)
+                # Minimum gap + directional sanity guards
+                if abs(t1 - price) / price < 0.01 or abs(stop - price) / price < 0.007:
+                    continue
+                if direction == "BULLISH" and (t1 <= price or stop >= price):
+                    continue
+                if direction == "BEARISH" and (t1 >= price or stop <= price):
+                    continue
+                rr = round(abs(t1 - price) / (abs(price - stop) + 1e-9), 2)
+                _paper_log(s, mkt_type, direction, conf, price, t1, t2, stop, rr)
+            except Exception as _e:
+                pass
+
+
+def _paper_auto_scan_loop():
+    """Background thread: auto-scan every 5 minutes, log trades server-side."""
+    time.sleep(90)   # wait for seeds and OHLCV cache to warm up
+    while True:
+        try:
+            _paper_run_scan()
+        except Exception as e:
+            print(f"[PAPER SCAN] {e}")
+        time.sleep(300)   # 5 minutes
+
+
+threading.Thread(target=_paper_auto_scan_loop, daemon=True).start()
+
+# Background OHLCV refresh loop — runs at startup then every 50 minutes so
+# the cache never expires under live user traffic (TTL is 60 min).
+def _ohlcv_refresh_loop():
+    all_tickers = (
+        [s["yf"] for s in EU_STOCKS   if s.get("yf")] +
+        [s["yf"] for s in ASIA_STOCKS if s.get("yf")] +
+        [s["yf"] for s in US_STOCKS   if s.get("yf")]
+    )
+    while True:
+        _batch_prefetch_ohlcv(all_tickers, period="120d", interval="1d", batch_size=30)
+        time.sleep(50 * 60)   # 50 minutes — refresh before 60-min TTL expires
+threading.Thread(target=_ohlcv_refresh_loop, daemon=True).start()
+
 # ── Technical indicator helpers ───────────────────────────────────────────────
 def _rsi(s, p=14):
+    # Wilder's smoothing (alpha = 1/period) — matches TradingView / Bloomberg
     d = s.diff()
-    g = d.clip(lower=0).rolling(p).mean()
-    l = (-d.clip(upper=0)).rolling(p).mean()
-    return 100 - 100 / (1 + g / (l + 1e-9))
+    gain = d.clip(lower=0).ewm(alpha=1/p, adjust=False, min_periods=p).mean()
+    loss = (-d.clip(upper=0)).ewm(alpha=1/p, adjust=False, min_periods=p).mean()
+    return 100 - 100 / (1 + gain / (loss + 1e-9))
 
 def _ema(s, p):
     return s.ewm(span=p, adjust=False).mean()
 
 def _atr(h, l, c, p=14):
+    # Wilder's smoothed ATR — matches standard charting platforms
     tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    return tr.rolling(p).mean()
+    return tr.ewm(alpha=1/p, adjust=False, min_periods=p).mean()
 
 def _macd(c, f=12, sl=26, sig=9):
     ml = _ema(c, f) - _ema(c, sl)
@@ -643,25 +821,103 @@ def _stoch(h, l, c, k=14, d=3):
     return K, K.rolling(d).mean()
 
 def _adx(h, l, c, p=14):
+    # Wilder's ADX — smoothed +DM/-DM over Wilder's ATR
     up = h.diff(); dn = -l.diff()
-    pdm = np.where((up > dn) & (up > 0), up, 0.0)
-    mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    tr_s = _atr(h, l, c, p)
-    pdi = 100 * pd.Series(pdm, index=h.index).rolling(p).mean() / (tr_s + 1e-9)
-    mdi = 100 * pd.Series(mdm, index=h.index).rolling(p).mean() / (tr_s + 1e-9)
-    dx = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
-    return dx.rolling(p).mean(), pdi, mdi
+    pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=h.index)
+    mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=h.index)
+    tr_s  = _atr(h, l, c, p)
+    pdm_s = pdm.ewm(alpha=1/p, adjust=False, min_periods=p).mean()
+    mdm_s = mdm.ewm(alpha=1/p, adjust=False, min_periods=p).mean()
+    pdi = 100 * pdm_s / (tr_s + 1e-9)
+    mdi = 100 * mdm_s / (tr_s + 1e-9)
+    dx  = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
+    return dx.ewm(alpha=1/p, adjust=False, min_periods=p).mean(), pdi, mdi
 
 _ohlcv_cache = {}
 _ohlcv_cache_ts = {}
+_ohlcv_cache_lock = threading.Lock()   # thread-safe writes from parallel startup threads
+_CACHE_TTL = 3600                       # 1-hour TTL
+
+def _batch_prefetch_ohlcv(tickers: list, period="120d", interval="1d", batch_size=30):
+    """
+    Fetch OHLCV for multiple tickers in batches using a single yf.download()
+    call per batch. Writes are lock-protected. Called at startup and every
+    50 minutes to keep the cache warm before the 1-hour TTL expires.
+    """
+    if not _yf_ok:
+        return
+    now = time.time()
+    batches = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
+    for batch in batches:
+        try:
+            raw = yf.download(
+                tickers=" ".join(batch),
+                period=period, interval=interval,
+                auto_adjust=True, progress=False,
+                threads=False, group_by="ticker",
+            )
+            if raw is None or raw.empty:
+                continue
+            is_multi = isinstance(raw.columns, pd.MultiIndex)
+            for ticker in batch:
+                try:
+                    if not is_multi:
+                        df = raw.copy()
+                    else:
+                        if ticker not in raw.columns.get_level_values(0):
+                            continue
+                        df = raw[ticker].copy()
+                    df.columns = [str(c).strip().title() for c in df.columns]
+                    if "Close" not in df.columns:
+                        continue
+                    df = df[["Open","High","Low","Close","Volume"]].dropna()
+                    if len(df) < 20:
+                        continue
+                    cache_key = f"{ticker}_{period}_{interval}"
+                    with _ohlcv_cache_lock:
+                        _ohlcv_cache[cache_key]    = df
+                        _ohlcv_cache_ts[cache_key] = now
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[BATCH OHLCV] batch failed: {e}")
+        time.sleep(1)   # 1s gap between batches to stay Yahoo-friendly
+    print(f"[BATCH OHLCV] Cache warmed: {len(_ohlcv_cache)} tickers")
 
 def fetch_ohlcv_stock(ticker, period="120d", interval="1d"):
     if not _yf_ok or not ticker:
         return None
     cache_key = f"{ticker}_{period}_{interval}"
     now = time.time()
-    if cache_key in _ohlcv_cache and now - _ohlcv_cache_ts.get(cache_key, 0) < 3600:
-        return _ohlcv_cache[cache_key]
+    age = now - _ohlcv_cache_ts.get(cache_key, 0)
+
+    # ── Stale-while-revalidate ────────────────────────────────────────────────
+    # Return cached data immediately (even if stale) so the user never waits.
+    # Trigger a background refresh if the entry is older than TTL.
+    cached = _ohlcv_cache.get(cache_key)
+    if cached is not None and age >= _CACHE_TTL:
+        def _bg_refresh():
+            try:
+                df = yf.download(ticker, period=period, interval=interval,
+                                 auto_adjust=True, progress=False, threads=False)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.columns = [str(c).strip().title() for c in df.columns]
+                if df.empty or "Close" not in df.columns: return
+                df = df[["Open","High","Low","Close","Volume"]].dropna()
+                if len(df) < 20: return
+                with _ohlcv_cache_lock:
+                    _ohlcv_cache[cache_key]    = df
+                    _ohlcv_cache_ts[cache_key] = time.time()
+            except Exception:
+                pass
+        threading.Thread(target=_bg_refresh, daemon=True).start()
+        return cached   # return stale data immediately — refresh happens in background
+
+    if cached is not None:
+        return cached   # fresh hit
+
+    # Cache miss — fetch synchronously (only happens before prefetch completes)
     try:
         df = yf.download(ticker, period=period, interval=interval,
                          auto_adjust=True, progress=False, threads=False)
@@ -673,8 +929,9 @@ def fetch_ohlcv_stock(ticker, period="120d", interval="1d"):
         df = df[["Open","High","Low","Close","Volume"]].dropna()
         if len(df) < 20:
             return None
-        _ohlcv_cache[cache_key] = df
-        _ohlcv_cache_ts[cache_key] = now
+        with _ohlcv_cache_lock:
+            _ohlcv_cache[cache_key]    = df
+            _ohlcv_cache_ts[cache_key] = time.time()
         return df
     except Exception as e:
         print(f"[OHLCV] {ticker}: {e}")
@@ -747,6 +1004,100 @@ def compute_indicators(df):
         "vol_ratio": round(vol_r, 2), "candle": candle, "price": round(price, 2),
     }
 
+# ── Weekly trend cache ────────────────────────────────────────────────────────
+_weekly_cache = {}
+_weekly_cache_ts = {}
+
+# ── Macro regime + VIX cache (6-hour TTL) ────────────────────────────────────
+_macro_cache    = {}
+_macro_cache_ts = {}
+
+# Market hours in UTC (open_hour, close_hour) — for signal gating
+MARKET_HOURS_UTC = {
+    "eu": (7,  17),   # LSE / Euronext / XETRA
+    "as": (0,   9),   # TSE / HKEX morning sessions
+    "us": (14, 21),   # NYSE / NASDAQ
+}
+
+def _market_is_open(market_type: str) -> bool:
+    import datetime as _dt
+    now_h = _dt.datetime.utcnow().hour
+    lo, hi = MARKET_HOURS_UTC.get(market_type, (0, 24))
+    return lo <= now_h < hi
+
+_BENCHMARKS = {"eu": "VGK", "as": "AAXJ", "us": "SPY"}
+
+def fetch_macro_regime(market_type: str) -> dict:
+    """Benchmark vs 200-EMA regime + VIX. Cached 6 hours."""
+    now = time.time()
+    if market_type in _macro_cache and now - _macro_cache_ts.get(market_type, 0) < 21600:
+        return _macro_cache[market_type]
+    result = {"regime": "NEUTRAL", "vix": 18.0, "vix_wide_sl": False}
+    try:
+        bench = _BENCHMARKS.get(market_type, "SPY")
+        df_b  = yf.download(bench, period="1y", interval="1d",
+                            auto_adjust=True, progress=False, threads=False)
+        if df_b is not None and len(df_b) >= 50:
+            c      = df_b["Close"].squeeze()
+            ema200 = float(c.ewm(span=200, adjust=False).mean().iloc[-1])
+            last   = float(c.iloc[-1])
+            if last > ema200 * 1.005:
+                result["regime"] = "BULL"
+            elif last < ema200 * 0.995:
+                result["regime"] = "BEAR"
+    except Exception:
+        pass
+    try:
+        df_vix = yf.download("^VIX", period="5d", interval="1d",
+                             auto_adjust=True, progress=False, threads=False)
+        if df_vix is not None and len(df_vix) > 0:
+            vix = float(df_vix["Close"].squeeze().iloc[-1])
+            result["vix"]         = round(vix, 1)
+            result["vix_wide_sl"] = vix > 25
+    except Exception:
+        pass
+    _macro_cache[market_type]    = result
+    _macro_cache_ts[market_type] = now
+    return result
+
+def fetch_weekly_trend(ticker):
+    """Fetch 52-week weekly OHLCV and return EMA10/EMA20 trend direction."""
+    now = time.time()
+    if ticker in _weekly_cache and now - _weekly_cache_ts.get(ticker, 0) < 21600:
+        return _weekly_cache[ticker]
+    try:
+        df = yf.download(ticker, period="1y", interval="1wk",
+                         auto_adjust=True, progress=False, threads=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if df is None or len(df) < 12:
+            return None
+        close = df["Close"].dropna()
+        ema10 = float(close.ewm(span=10, adjust=False).mean().iloc[-1])
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+        # Weekly RSI
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / (loss + 1e-9)
+        weekly_rsi = float(100 - 100 / (1 + rs.iloc[-1]))
+        # Trend direction
+        diff_pct = abs(ema10 - ema20) / (ema20 + 1e-9) * 100
+        if diff_pct < 0.5:
+            trend = "NEUTRAL"
+        elif ema10 > ema20:
+            trend = "UP"
+        else:
+            trend = "DOWN"
+        result = {"trend": trend, "ema10": round(ema10, 4),
+                  "ema20": round(ema20, 4), "weekly_rsi": round(weekly_rsi, 1)}
+        _weekly_cache[ticker] = result
+        _weekly_cache_ts[ticker] = now
+        return result
+    except Exception as e:
+        print(f"[WEEKLY] {ticker}: {e}")
+        return None
+
 def rule_based_signal(ind, ch):
     b = br = 0
     rsi = ind["rsi"]; macd = ind["macd"]; bb = ind["bb_pct"]
@@ -773,6 +1124,19 @@ def rule_based_signal(ind, ch):
     conf = round(min(82, max(20, abs(bp - 50) * 1.8 + strength)))
     if adx < 22 and direction != "NEUTRAL":
         direction = "NEUTRAL"; conf = round(conf * 0.55)
+    # Mean reversion filter — penalise signals that chase extended moves
+    ema50 = ind.get("ema50", 0)
+    price_ = ind.get("price", 0)
+    atr_pct = ind.get("atr", 0)
+    if ema50 > 0 and atr_pct > 0 and price_ > 0:
+        deviation_pct = (price_ - ema50) / ema50 * 100
+        atr_threshold = atr_pct * 2  # 2× ATR from EMA50 = extended
+        if direction == "BULLISH" and deviation_pct > atr_threshold:
+            # Price too far above EMA50 — reduce bull confidence
+            conf = round(conf * 0.80)
+        elif direction == "BEARISH" and deviation_pct < -atr_threshold:
+            # Price too far below EMA50 — reduce bear confidence (may bounce)
+            conf = round(conf * 0.80)
     return direction, conf, bp
 
 def swing_levels(df):
@@ -838,10 +1202,14 @@ def fetch_stock_news(stock_id, stock_name):
         except Exception as e:
             print(f"[NEWS] {stock_id} query={query}: {e}")
     with _news_cache_lock:
+        # Evict oldest entry when cache exceeds 200 tickers
+        if len(_news_cache) >= 200:
+            oldest = min(_news_cache, key=lambda k: _news_cache[k]["ts"])
+            del _news_cache[oldest]
         _news_cache[key] = {"items": items[:6], "ts": now}
     return items[:6]
 
-def score_news(items):
+def score_news(items, vol_ratio=1.0):
     if not items: return 0.0, 0.5
     total = 0.0
     for item in items:
@@ -850,7 +1218,8 @@ def score_news(items):
         item["score"] = round(score, 2)
         total += score
     avg = total / len(items)
-    bull = min(1.0, max(0.0, 0.5 + avg / 10))
+    vol_mult = min(2.0, vol_ratio * 0.7) if vol_ratio > 1.5 else 1.0
+    bull = min(1.0, max(0.0, 0.5 + avg * vol_mult / 10))
     return round(avg, 2), round(bull, 3)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1075,6 +1444,9 @@ def _build_consensus(rule_dir, rule_conf, bp, ml_pred):
 
 @app.route("/api/analyze", methods=["POST"])
 def analyze():
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+    if not _rate_ok(ip):
+        return jsonify({"error": "Too many requests — please wait a moment"}), 429
     try:
         data = request.get_json()
         stock_id = data.get("stockId")
@@ -1127,6 +1499,45 @@ def analyze():
 
         direction, conf, bp = rule_based_signal(indicators, change)
 
+        # ── Multi-timeframe confirmation ─────────────────────────────────────
+        weekly = None
+        weekly_boost = 0
+        try:
+            weekly = _yf_pool.submit(fetch_weekly_trend, _yf).result(timeout=15)
+        except Exception:
+            pass
+        if weekly:
+            wtrd = weekly.get("trend")
+            # Boost conf when weekly and daily align; penalise when they conflict
+            if wtrd == "UP" and direction == "BULLISH":
+                weekly_boost = +8
+            elif wtrd == "DOWN" and direction == "BEARISH":
+                weekly_boost = +8
+            elif wtrd == "UP" and direction == "BEARISH":
+                weekly_boost = -12
+            elif wtrd == "DOWN" and direction == "BULLISH":
+                weekly_boost = -12
+            conf = max(10, min(95, conf + weekly_boost))
+
+        # ── Macro regime filter ───────────────────────────────────────────────
+        macro = {}
+        try:
+            macro = _yf_pool.submit(fetch_macro_regime, market_type).result(timeout=15)
+        except Exception:
+            pass
+        macro_regime  = macro.get("regime", "NEUTRAL")
+        vix           = macro.get("vix", 18.0)
+        vix_wide_sl   = macro.get("vix_wide_sl", False)
+        if macro_regime == "BEAR" and direction == "BULLISH":
+            conf = max(10, min(95, conf - 15))
+        elif macro_regime == "BULL" and direction == "BEARISH":
+            conf = max(10, min(95, conf - 10))
+        elif macro_regime == "BULL" and direction == "BULLISH":
+            conf = max(10, min(95, conf + 5))
+
+        # ── Market hours gate ─────────────────────────────────────────────────
+        market_open = _market_is_open(market_type)
+
         # TP/SL from swing levels or ATR
         atr_raw = indicators["atr_raw"]
         if df is not None and len(df) >= 20:
@@ -1146,18 +1557,26 @@ def analyze():
         m = max(atr_raw / price, 0.008)  # floor at 0.8% to avoid noise-level stops
         if direction == "BULLISH":
             t1   = round(nearest_above(1.5) or price*(1+m*2.5), 2)
+            # Ensure TP1 is actually above price
+            if t1 <= price:
+                t1 = round(price * (1 + m * 2.5), 2)
             t2   = round(nearest_above(3.0) or price*(1+m*5.0), 2)
             if t2 <= t1:
                 t2 = round(t1 + atr_raw * 2.5, 2)
             stop = round((nearest_below(1.0) or price*(1-m*1.5)) * 0.9985, 2)
+            # Ensure SL is actually below price
             if stop >= price:
                 stop = round(price * (1 - m * 1.5), 2)
         elif direction == "BEARISH":
             t1   = round(nearest_below(1.5) or price*(1-m*2.5), 2)
+            # Ensure TP1 is actually below price
+            if t1 >= price:
+                t1 = round(price * (1 - m * 2.5), 2)
             t2   = round(nearest_below(3.0) or price*(1-m*5.0), 2)
             if t2 >= t1:
                 t2 = round(t1 - atr_raw * 2.5, 2)
             stop = round((nearest_above(1.0) or price*(1+m*1.5)) * 1.0015, 2)
+            # Ensure SL is actually above price
             if stop <= price:
                 stop = round(price * (1 + m * 1.5), 2)
         else:
@@ -1167,11 +1586,36 @@ def analyze():
 
         rr = round(abs(t1 - price) / (abs(price - stop) + 1e-6), 2)
 
+        # ── VIX: widen SL when market is fearful ─────────────────────────────
+        if vix_wide_sl and direction in ("BULLISH", "BEARISH"):
+            vix_extra = atr_raw * 0.5
+            if direction == "BULLISH":
+                stop = round(stop - vix_extra, 2)
+            else:
+                stop = round(stop + vix_extra, 2)
+            rr = round(abs(t1 - price) / (abs(price - stop) + 1e-6), 2)
+
+        # ── Spread/slippage simulation (0.30% round-trip — Trading 212) ──────
+        SPREAD_PCT = 0.003
+        if direction == "BULLISH":
+            eff_entry = price * (1 + SPREAD_PCT / 2)
+            eff_tp1   = t1   * (1 - SPREAD_PCT / 2)
+            eff_stop  = stop * (1 - SPREAD_PCT / 2)
+        elif direction == "BEARISH":
+            eff_entry = price * (1 - SPREAD_PCT / 2)
+            eff_tp1   = t1   * (1 + SPREAD_PCT / 2)
+            eff_stop  = stop * (1 + SPREAD_PCT / 2)
+        else:
+            eff_entry, eff_tp1, eff_stop = price, t1, stop
+        rr_after_spread = round(
+            abs(eff_tp1 - eff_entry) / (abs(eff_entry - eff_stop) + 1e-6), 2
+        )
+
         # News
         news_items = []
         try: news_items = fetch_stock_news(stock_id, stock_info["name"])
         except: pass
-        news_score, news_bull = score_news(news_items)
+        news_score, news_bull = score_news(news_items, indicators.get("vol_ratio", 1.0))
 
         # Trend label
         adx = indicators["adx"]
@@ -1220,13 +1664,14 @@ def analyze():
         trade_brief = _build_trade_brief(direction, conf, price, t1, t2, stop, rr,
                                          indicators, news_score, news_items, data_src)
 
-        # ── Record to signal history when tradeable ───────────────────────
-        if consensus.get("tradeable"):
+        # ── Record to signal history — only during market hours ──────────────
+        if consensus.get("tradeable") and market_open:
             with _signal_history_lock:
                 _signal_history.append({
                     "id": stock_id, "name": stock_info["name"],
                     "market": market_type, "direction": direction, "conf": conf,
                     "entry": price, "stop": stop, "tp1": t1, "tp2": t2, "rr": rr,
+                    "rrAfterSpread": rr_after_spread,
                     "time": time.strftime("%d %b %H:%M", time.gmtime()),
                 })
                 if len(_signal_history) > 100:
@@ -1237,9 +1682,16 @@ def analyze():
             "stockInfo": stock_info,
             "price": price, "change": change,
             "indicators": indicators,
+            "macro": {
+                "regime":    macro_regime,
+                "vix":       vix,
+                "vixWideSL": vix_wide_sl,
+                "marketOpen": market_open,
+            },
             "prediction": {
                 "dir": direction, "bullPct": bp, "bearPct": 100-bp,
-                "conf": conf, "targets": {"t1":t1,"t2":t2,"stop":stop}, "rr": rr,
+                "conf": conf, "targets": {"t1":t1,"t2":t2,"stop":stop},
+                "rr": rr, "rrAfterSpread": rr_after_spread,
             },
             "mlPrediction": ml_pred,
             "consensus": consensus,
@@ -1284,7 +1736,8 @@ def predict():
     yf_ticker = stock_info.get("yf") or (stock_id + ".NG" if stock_info.get("currency") == "NGN" else stock_id)
     df = fetch_ohlcv_stock(yf_ticker)
 
-    state = next((s for s in _stock_state if s["id"] == stock_id), {})
+    _all_mkts = {**market_eu, **market_as, **market_us}
+    state = _all_mkts.get(stock_id, {})
     current_price = float(state.get("price", 0)) or (df["Close"].iloc[-1] if df is not None else 0)
 
     result = ml_predict(df, current_price)
@@ -1309,6 +1762,161 @@ def model_status():
     ready = db_ready()
     stats = db_stats() if ready else {"total": 0}
     return jsonify({"ready": ready, "stats": stats})
+
+
+@app.route("/api/db_stats")
+def db_stats_route():
+    """Return Supabase connection status and accumulated data summary."""
+    try:
+        from database import get_data_summary, is_connected
+        return jsonify(get_data_summary())
+    except Exception as e:
+        return jsonify({"connected": False, "error": str(e)})
+
+
+@app.route("/api/training_status")
+def training_status_route():
+    """Return retraining scheduler state."""
+    try:
+        from retrain_scheduler import get_status
+        return jsonify(get_status())
+    except Exception as e:
+        return jsonify({"error": str(e), "running": False, "last_run": None})
+
+
+# ── Paper trading routes — in-memory backend, no DB required ──────────────────
+
+@app.route("/api/paper_trades", methods=["GET"])
+def get_paper_trades_route():
+    with _paper_lock:
+        trades = list(_paper_trades)
+    closed = [t for t in trades if t["status"] == "CLOSED"]
+    open_  = [t for t in trades if t["status"] == "OPEN"]
+    wins   = sum(1 for t in closed if t["result"] == "WIN")
+    losses = sum(1 for t in closed if t["result"] == "LOSS")
+    acc    = round(wins / len(closed) * 100) if closed else None
+    return jsonify(_sanitize({
+        "ok": True,
+        "trades": list(reversed(trades)),   # newest first
+        "stats": {
+            "open": len(open_), "closed": len(closed),
+            "wins": wins, "losses": losses, "accuracy": acc,
+        },
+    }))
+
+
+@app.route("/api/paper_trades/reset", methods=["POST"])
+def reset_paper_trades_route():
+    with _paper_lock:
+        _paper_trades.clear()
+    broadcast({"type": "paper_trades_reset"})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/export/trades", methods=["GET"])
+def export_trades():
+    """
+    Download paper trade history as CSV with summary stats.
+    Query params:
+      days=7    — limit to last N days (default: all)
+      fmt=csv   — only csv supported for now
+    """
+    import csv, io
+    days_param = request.args.get("days")
+    cutoff = None
+    if days_param:
+        try:
+            cutoff_ts = time.time() - int(days_param) * 86400
+            cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(cutoff_ts))
+        except ValueError:
+            pass
+
+    with _paper_lock:
+        all_trades = list(_paper_trades)
+
+    if cutoff:
+        all_trades = [t for t in all_trades if t.get("time", "") >= cutoff]
+
+    closed = [t for t in all_trades if t["status"] == "CLOSED"]
+    open_  = [t for t in all_trades if t["status"] == "OPEN"]
+    wins   = [t for t in closed if t.get("result") == "WIN"]
+    losses = [t for t in closed if t.get("result") == "LOSS"]
+    acc    = round(len(wins) / len(closed) * 100, 1) if closed else None
+
+    # Per-market breakdown
+    mkt_map: dict = {}
+    for t in closed:
+        m = t.get("market", "?")
+        bucket = mkt_map.setdefault(m, {"trades": 0, "wins": 0, "losses": 0})
+        bucket["trades"] += 1
+        if t.get("result") == "WIN":   bucket["wins"] += 1
+        if t.get("result") == "LOSS":  bucket["losses"] += 1
+
+    # Average P&L % for closed trades (approx: winner ~TP1 gap, loser ~SL gap)
+    pnl_vals = []
+    for t in closed:
+        ep = t.get("entry_price", 0)
+        if ep and ep > 0:
+            if t.get("result") == "WIN":
+                pnl_vals.append(round((t.get("tp1", ep) - ep) / ep * 100, 2))
+            elif t.get("result") == "LOSS":
+                pnl_vals.append(round((t.get("stop", ep) - ep) / ep * 100, 2))
+    avg_pnl = round(sum(pnl_vals) / len(pnl_vals), 2) if pnl_vals else None
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+
+    # ── Summary header ────────────────────────────────────────────────────────
+    period_label = f"Last {days_param} days" if days_param else "All time"
+    w.writerow(["STOCK NEXUS — PAPER TRADE REPORT"])
+    w.writerow([f"Period: {period_label}"])
+    w.writerow([f"Generated: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}"])
+    w.writerow([])
+    w.writerow(["SUMMARY"])
+    w.writerow(["Total Trades", len(all_trades)])
+    w.writerow(["Open", len(open_)])
+    w.writerow(["Closed", len(closed)])
+    w.writerow(["Wins", len(wins)])
+    w.writerow(["Losses", len(losses)])
+    w.writerow(["Accuracy", f"{acc}%" if acc is not None else "—"])
+    w.writerow(["Avg P&L %", f"{avg_pnl}%" if avg_pnl is not None else "—"])
+    w.writerow([])
+
+    if mkt_map:
+        w.writerow(["BY MARKET", "Trades", "Wins", "Losses", "Accuracy"])
+        for mkt_name, bkt in sorted(mkt_map.items()):
+            mkt_acc = round(bkt["wins"] / bkt["trades"] * 100, 1) if bkt["trades"] else 0
+            w.writerow([mkt_name, bkt["trades"], bkt["wins"], bkt["losses"], f"{mkt_acc}%"])
+        w.writerow([])
+
+    # ── Trade rows ────────────────────────────────────────────────────────────
+    w.writerow(["ALL TRADES"])
+    w.writerow(["Time", "Market", "Stock", "Direction", "Confidence",
+                "Entry", "Stop", "TP1", "TP2", "R:R",
+                "Status", "Result", "Exit Price", "Exit Time", "P&L %"])
+    for t in all_trades:
+        ep = t.get("entry_price") or 0
+        pnl = ""
+        if ep > 0:
+            if t.get("result") == "WIN":
+                pnl = f"{round((t.get('tp1', ep) - ep) / ep * 100, 2)}%"
+            elif t.get("result") == "LOSS":
+                pnl = f"{round((t.get('stop', ep) - ep) / ep * 100, 2)}%"
+        w.writerow([
+            t.get("time", ""), t.get("market", ""), t.get("stock", ""),
+            t.get("direction", ""), f"{t.get('confidence', '')}%",
+            ep, t.get("stop", ""), t.get("tp1", ""), t.get("tp2", ""),
+            t.get("rr", ""), t.get("status", ""), t.get("result", ""),
+            t.get("exit_price", ""), t.get("exit_time", ""), pnl,
+        ])
+
+    csv_bytes = buf.getvalue().encode("utf-8")
+    filename = f"nexus_paper_trades_{time.strftime('%Y%m%d')}.csv"
+    return Response(
+        csv_bytes,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.route("/api/analyze_chart", methods=["POST"])

@@ -13,7 +13,8 @@ let euSectorFilter = "ALL";
 let usSectorFilter = "ALL";
 const CURR_SYMS = {"USD":"$","EUR":"€","GBP":"p","JPY":"¥","HKD":"HK$","INR":"₹","KRW":"₩","CHF":"Fr","DKK":"kr","SEK":"kr","NGN":"₦"};
 let trades      = JSON.parse(localStorage.getItem("sn_trades")  || "[]");
-let paperTrades = JSON.parse(localStorage.getItem("sn_paper")   || "[]");
+let paperTrades = [];   // loaded from server on init; localStorage is fallback only
+let _dbOnline   = false;
 
 // ── FORMAT HELPERS ─────────────────────────────────────────────
 function fp(v, currency = "USD") {
@@ -32,6 +33,14 @@ function fpRaw(v) {
   return v.toFixed(2);
 }
 function fPct(v) { return (v >= 0 ? "+" : "") + v.toFixed(2) + "%"; }
+// XSS-safe HTML escaping for untrusted server strings injected via innerHTML
+const _esc_div = document.createElement("div");
+function esc(s) {
+  _esc_div.textContent = s == null ? "" : String(s);
+  return _esc_div.innerHTML;
+}
+// Validate URLs before using in href/onclick — allow only http/https
+function safeUrl(u) { try { const p = new URL(u); return (p.protocol === "https:" || p.protocol === "http:") ? u : "#"; } catch { return "#"; } }
 function chColor(v) { return v > 0 ? "var(--green)" : v < 0 ? "var(--red)" : "var(--text3)"; }
 function chClass(v) { return v > 0 ? "price-up" : v < 0 ? "price-down" : "price-neutral"; }
 function dirColor(d) { return d==="BULLISH"?"var(--green)":d==="BEARISH"?"var(--red)":"var(--amber)"; }
@@ -71,6 +80,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     renderPredSidebar();
     renderJournal();
     startSSE();
+
+    // Load paper trades from server (universal across devices)
+    await loadPaperTradesFromServer();
 
     // Morning brief on dashboard
     loadMorningBrief();
@@ -134,6 +146,15 @@ function startSSE() {
     }
     if (msg.type === "tick") handleTick(msg);
     if (msg.type === "status") setWsStatus(msg.status);
+    if (msg.type === "paper_trade_new" || msg.type === "paper_trade_closed") {
+      // Reload paper trades from server when backend logs or closes a trade
+      loadPaperTradesFromServer();
+    }
+    if (msg.type === "paper_trades_reset") {
+      paperTrades = [];
+      if (currentPage === "journal") renderPaperStats();
+      updateJournalBadge();
+    }
   };
   sseSource.onerror = () => setWsStatus("error");
 }
@@ -169,7 +190,7 @@ function handleTick(msg) {
   updatePredHeaderPrice(id, price, change);
   if (currentPage === "dashboard") updateDashKPIs();
   updateHeatCell(id, change);
-  checkPaperTrades(id, price);
+  // TP/SL exit monitoring now runs server-side in price_poll_thread
 }
 
 function flashCell(id, dir) {
@@ -656,7 +677,7 @@ async function runAnalysis() {
 function renderAnalysisResult(d, balance, riskPct) {
   if (d.error) {
     document.getElementById("pred-content").innerHTML =
-      `<div style="color:var(--red);font-family:var(--font-mono);font-size:10px;padding:20px">ERROR: ${d.error}</div>`;
+      `<div style="color:var(--red);font-family:var(--font-mono);font-size:10px;padding:20px">ERROR: ${esc(d.error)}</div>`;
     return;
   }
 
@@ -702,16 +723,43 @@ function renderAnalysisResult(d, balance, riskPct) {
       </div>
       <div class="news-list">
         ${d.news.slice(0,4).map(n=>`
-          <div class="news-item" onclick="window.open('${n.url||"#"}','_blank')">
-            <div class="news-title">${n.title||"—"}</div>
-            <div class="news-meta">${n.source||""} · ${n.score!=null?`SCORE: ${n.score>0?"+":""}${n.score}`:""}</div>
+          <div class="news-item" onclick="window.open('${safeUrl(n.url||"")}','_blank')">
+            <div class="news-title">${esc(n.title)||"—"}</div>
+            <div class="news-meta">${esc(n.source||"")} · ${n.score!=null?`SCORE: ${n.score>0?"+":""}${n.score}`:""}</div>
           </div>`).join("")}
       </div>
     </div>`;
   }
 
+  // ── Macro context bar ──────────────────────────────────────────────────────
+  const macro      = d.macro || {};
+  const regime     = macro.regime || "NEUTRAL";
+  const vix        = macro.vix != null ? parseFloat(macro.vix).toFixed(1) : "—";
+  const mktOpen    = macro.marketOpen;
+  const rrSpread   = d.prediction?.rrAfterSpread;
+  const regColor   = regime==="BULL" ? "var(--green)" : regime==="BEAR" ? "var(--red)" : "var(--amber)";
+  const vixColor   = parseFloat(vix)>25 ? "var(--red)" : parseFloat(vix)>18 ? "var(--amber)" : "var(--green)";
+  const macroBar   = `
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;font-family:var(--font-mono);font-size:9px">
+    <span style="background:var(--card2);padding:3px 8px;border-radius:4px">
+      MACRO <span style="color:${regColor};font-weight:700">${regime}</span>
+    </span>
+    <span style="background:var(--card2);padding:3px 8px;border-radius:4px">
+      VIX <span style="color:${vixColor};font-weight:700">${vix}</span>${macro.vixWideSL ? " · SL WIDENED" : ""}
+    </span>
+    ${rrSpread != null ? `<span style="background:var(--card2);padding:3px 8px;border-radius:4px">
+      R:R AFTER SPREAD <span style="color:var(--cyan);font-weight:700">${rrSpread}:1</span>
+    </span>` : ""}
+    <span style="background:var(--card2);padding:3px 8px;border-radius:4px">
+      ${mktOpen
+        ? `<span style="color:var(--green)">● MARKET OPEN</span>`
+        : `<span style="color:var(--text3)">● MARKET CLOSED</span>`}
+    </span>
+  </div>`;
+
   document.getElementById("pred-content").innerHTML = `
   <div class="fadeIn">
+    ${macroBar}
 
     <!-- TRADE BRIEF CARD — primary action signal -->
     ${renderTradeBrief(d.tradeBrief, sym, d.stockId, predMarket)}
@@ -900,7 +948,7 @@ function renderAnalysisResult(d, balance, riskPct) {
 
     <!-- AI TEXT -->
     <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:8px">AI ANALYSIS SUMMARY</div>
-    <div class="ai-text-box">${d.aiText||""}</div>
+    <div class="ai-text-box">${esc(d.aiText||"")}</div>
 
     ${newsHtml}
 
@@ -912,60 +960,64 @@ function renderAnalysisResult(d, balance, riskPct) {
   </div>`;
 }
 
-// ── AUTO PAPER TRADING ─────────────────────────────────
-function autoPaperTrade(results) {
-  // Only auto-log strong signals (conf >= 68%) with realistic TP/SL gaps
-  const strong = results.filter(r => {
-    if (r.conf < 68 || !r.t1 || !r.stop || !r.price) return false;
-    const tp1Gap = Math.abs(r.t1   - r.price) / r.price;  // need >= 1% to TP1
-    const slGap  = Math.abs(r.stop - r.price) / r.price;  // need >= 0.7% to SL
-    return tp1Gap >= 0.01 && slGap >= 0.007;
-  });
-  let added = 0;
-  for (const r of strong) {
-    // Don't double-log the same stock if already open
-    if (paperTrades.find(p => p.id === r.id && p.status === "OPEN")) continue;
-    paperTrades.push({
-      id: r.id, name: r.name, market: r.market,
-      currency: r.currency, color: r.color,
-      direction: r.direction, conf: r.conf,
-      entry: r.price, stop: r.stop, tp1: r.t1, tp2: r.t2, rr: r.rr,
-      time: new Date().toISOString(),
-      status: "OPEN", result: null, exitPrice: null, exitTime: null,
-    });
-    added++;
-  }
-  if (added) {
-    localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
-    renderPaperStats();
-    // Update journal tab badge
-    const jNav = document.querySelector('.nav-item[data-page="journal"]');
-    if (jNav) {
-      const open = paperTrades.filter(p => p.status === "OPEN").length;
-      jNav.querySelector("span:last-child").textContent = `TRADE ${open > 0 ? "(" + open + ")" : ""}`;
+// ── PAPER TRADING — SERVER-BACKED ──────────────────────
+
+async function loadPaperTradesFromServer() {
+  try {
+    const res  = await fetch("/api/paper_trades");
+    const data = await res.json();
+    if (data.ok) {
+      paperTrades = data.trades.map(normalisePaperTrade);
+      renderPaperStats();
+      updateJournalBadge();
     }
+  } catch(e) {
+    // Server unreachable — show empty state, don't pollute with stale localStorage
+    console.warn("paper_trades fetch failed:", e);
   }
 }
 
-function checkPaperTrades(stockId, price) {
-  let changed = false;
-  for (const t of paperTrades) {
-    if (t.id !== stockId || t.status !== "OPEN") continue;
-    const isLong = t.direction === "BULLISH";
-    const hitTP  = isLong ? price >= t.tp1 : price <= t.tp1;
-    const hitSL  = isLong ? price <= t.stop : price >= t.stop;
-    if (hitTP || hitSL) {
-      t.status    = "CLOSED";
-      t.result    = hitTP ? "WIN" : "LOSS";
-      t.exitPrice = hitTP ? t.tp1 : t.stop;
-      t.exitTime  = new Date().toISOString();
-      changed = true;
-    }
+// Normalise snake_case keys from DB to camelCase used in UI
+function normalisePaperTrade(t) {
+  return {
+    id:        t.id,
+    ticker:    t.ticker || t.id.split("_")[0],
+    name:      t.name,
+    market:    t.market,
+    currency:  t.currency,
+    color:     t.color,
+    direction: t.direction,
+    conf:      t.conf,
+    entry:     parseFloat(t.entry),
+    stop:      parseFloat(t.stop),
+    tp1:       parseFloat(t.tp1),
+    tp2:       t.tp2 ? parseFloat(t.tp2) : null,
+    rr:        t.rr,
+    time:      t.time,
+    status:    t.status,
+    result:    t.result || null,
+    exitPrice: t.exit_price ? parseFloat(t.exit_price) : null,
+    exitTime:  t.exit_time  || null,
+  };
+}
+
+function updateJournalBadge() {
+  const jNav = document.querySelector('.nav-item[data-page="journal"]');
+  if (jNav) {
+    const open = paperTrades.filter(p => p.status === "OPEN").length;
+    jNav.querySelector("span:last-child").textContent = `TRADE ${open > 0 ? "(" + open + ")" : ""}`;
   }
-  if (changed) {
-    localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
-    if (currentPage === "journal") renderPaperStats();
-  }
+}
+
+async function autoPaperTrade(_results) {
+  // Auto paper trading now runs server-side via _paper_auto_scan_loop.
+  // The backend broadcasts paper_trade_new events which trigger loadPaperTradesFromServer().
+  // This function is kept as a no-op so existing call sites don't break.
+}
+
+function checkPaperTrades(_stockId, _price) {
+  // TP1/SL exit monitoring now runs server-side in price_poll_thread.
+  // The backend broadcasts paper_trade_closed events → loadPaperTradesFromServer().
 }
 
 function renderPaperStats() {
@@ -977,16 +1029,17 @@ function renderPaperStats() {
   const losses = closed.filter(t => t.result === "LOSS").length;
   const acc    = closed.length ? Math.round(wins / closed.length * 100) : null;
   const accColor = acc === null ? "var(--text3)" : acc >= 55 ? "var(--green)" : acc >= 45 ? "var(--amber)" : "var(--red)";
+  const dbBadge  = `<span style="color:var(--green);font-size:8px;margin-left:8px">● SERVER</span>`;
 
-  const rowHtml = (trades, showStatus) => trades.slice(0,8).map(t => {
+  const rowHtml = (trades, showStatus) => trades.slice(0, 8).map(t => {
     const sym = currSym(t.currency || "USD");
     const isLong = t.direction === "BULLISH";
     const dc = isLong ? "var(--green)" : "var(--red)";
     const flag = t.market==="eu"?"🌍":t.market==="as"?"🌏":"🇺🇸";
     const pnl = t.exitPrice ? ((isLong ? t.exitPrice - t.entry : t.entry - t.exitPrice) / t.entry * 100).toFixed(2) : null;
-    return `<div class="paper-row" onclick="quickSelect('${t.id}','${t.market}')">
+    return `<div class="paper-row" onclick="quickSelect('${t.ticker||t.id}','${t.market}')">
       <div style="color:var(--text2)">${new Date(t.time).toLocaleDateString("en",{month:"short",day:"numeric"})}</div>
-      <div style="font-weight:700;color:${t.color||dc}">${flag} ${t.id}</div>
+      <div style="font-weight:700;color:${t.color||dc}">${flag} ${t.ticker||t.id.split('_')[0]}</div>
       <div style="color:${dc}">${isLong?"▲ LONG":"▼ SHORT"}</div>
       <div style="font-family:var(--font-mono);font-size:9px">${sym}${fpRaw(t.entry)}</div>
       <div style="font-family:var(--font-mono);font-size:9px;color:var(--red)">${sym}${fpRaw(t.stop)}</div>
@@ -1000,11 +1053,14 @@ function renderPaperStats() {
 
   el.innerHTML = `
   <div class="section-title" style="margin-bottom:14px">
-    AUTO PAPER TRADING — ACCURACY TRACKER
-    <button class="btn-secondary" style="float:right;font-size:9px;padding:2px 8px" onclick="clearPaperTrades()">RESET</button>
+    AUTO PAPER TRADING — ACCURACY TRACKER ${dbBadge}
+    <span style="float:right;display:inline-flex;gap:6px">
+      <button class="btn-secondary" style="font-size:9px;padding:2px 8px" onclick="exportPaperTradesCSV()">EXPORT CSV</button>
+      <button class="btn-secondary" style="font-size:9px;padding:2px 8px" onclick="clearPaperTrades()">RESET</button>
+    </span>
   </div>
   <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-bottom:12px">
-    Strong signals (≥65% confidence) are auto-logged here. Wins = TP1 hit. Losses = SL hit.
+    Server auto-scans every 5 min. Strong signals (≥68% conf, TP1≥1% away) are logged automatically — even when the browser is closed. Wins = TP1 hit. Losses = SL hit.
   </div>
   <div class="paper-kpis">
     <div class="paper-kpi"><div class="pk-val" style="color:var(--cyan)">${open.length}</div><div class="pk-lbl">OPEN</div></div>
@@ -1024,18 +1080,29 @@ function renderPaperStats() {
   <div class="paper-header paper-row">
     <span>DATE</span><span>STOCK</span><span>DIR</span><span>ENTRY</span><span>SL</span><span>TP1</span><span>R:R</span><span>RESULT</span>
   </div>
-  ${rowHtml(closed.reverse(), false)}` : ""}
+  ${rowHtml([...closed].reverse(), false)}` : ""}
   ${!open.length && !closed.length ? `
   <div class="empty-state" style="padding:24px 0">
     <div class="empty-sub">No paper trades yet.<br/>Auto-logs when a scan finds a signal ≥65% confidence.</div>
   </div>` : ""}`;
 }
 
-function clearPaperTrades() {
+async function clearPaperTrades() {
   if (!confirm("Reset all paper trade data?")) return;
+  await fetch("/api/paper_trades/reset", { method: "POST" });
   paperTrades = [];
-  localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
   renderPaperStats();
+  updateJournalBadge();
+}
+
+function exportPaperTradesCSV() {
+  const days = prompt("Export last N days of trades (leave blank for all time):", "7");
+  if (days === null) return; // cancelled
+  const qs = days.trim() !== "" && !isNaN(Number(days)) ? `?days=${encodeURIComponent(days.trim())}` : "";
+  const a = document.createElement("a");
+  a.href = `/api/export/trades${qs}`;
+  a.download = "";
+  a.click();
 }
 
 // ── MORNING BRIEF ──────────────────────────────────────
@@ -1112,7 +1179,7 @@ function renderMorningBrief(data) {
 // ── SCANNER ────────────────────────────────────────────────────
 function setScanMarket(mkt, btn) {
   scanMarket = mkt;
-  document.querySelectorAll(".cat-filters .cat-btn").forEach(b => b.classList.remove("active"));
+  document.querySelectorAll("#page-scanner .cat-btn").forEach(b => b.classList.remove("active"));
   if (btn) btn.classList.add("active");
 }
 
@@ -1326,7 +1393,7 @@ function renderChartResult(data) {
     document.getElementById("chartai-result-panel").innerHTML = `
       <div style="padding:20px">
         <div style="color:var(--red);font-family:var(--font-mono);font-size:10px;margin-bottom:12px">⚠ ANALYSIS FAILED</div>
-        <div style="color:var(--text2);font-family:var(--font-mono);font-size:10px;white-space:pre-wrap">${data.error||"Unknown error"}</div>
+        <div style="color:var(--text2);font-family:var(--font-mono);font-size:10px;white-space:pre-wrap">${esc(data.error||"Unknown error")}</div>
         ${isNotBuilt ? `
         <div style="color:var(--amber);font-family:var(--font-mono);font-size:9px;margin-top:16px;line-height:2;border:1px solid var(--amber);padding:10px;border-radius:4px">
           ▶ TO BUILD THE DATABASE, run this once in your terminal:<br/>
@@ -1543,7 +1610,8 @@ function exportTrades() {
     const pnl = calcPnL(t);
     return [t.mkt,t.stock,t.dir,t.entry,t.exitPrice||"",t.qty,t.stop,t.tp1,t.status,pnl,t.date,t.notes||""];
   });
-  const csv = [headers,...rows].map(r=>r.join(",")).join("\n");
+  const csvEsc = v => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
+  const csv = [headers,...rows].map(r => r.map(csvEsc).join(",")).join("\n");
   const blob = new Blob([csv], {type:"text/csv"});
   const url  = URL.createObjectURL(blob);
   const a    = Object.assign(document.createElement("a"), {href:url,download:"stock_nexus_trades.csv"});
