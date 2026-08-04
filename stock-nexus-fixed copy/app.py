@@ -60,9 +60,12 @@ def _mongo_connect():
         print("[MONGO] MONGODB_URI not set — running in-memory only", flush=True)
         return
     try:
+        import certifi
         from pymongo import MongoClient, ASCENDING
         from pymongo.server_api import ServerApi
         client = MongoClient(uri, server_api=ServerApi("1"),
+                             tls=True,
+                             tlsCAFile=certifi.where(),
                              serverSelectionTimeoutMS=10000,
                              connectTimeoutMS=10000,
                              socketTimeoutMS=10000)
