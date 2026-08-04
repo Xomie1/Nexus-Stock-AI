@@ -43,9 +43,58 @@ try:
 except ImportError:
     pass  # python-dotenv optional — env vars still work via OS / Render dashboard
 
-# ── Persistent storage (optional — graceful fallback) ─────────────────────────
-_db_ok = False
-def _db_connected(): return False
+# ── MongoDB Atlas persistence (graceful fallback to in-memory if unavailable) ──
+_mongo_client = None
+_mongo_col    = None   # paper_trades collection
+
+def _mongo_connect():
+    global _mongo_client, _mongo_col
+    uri = os.environ.get("MONGODB_URI", "").strip()
+    if not uri:
+        print("[MONGO] MONGODB_URI not set — running in-memory only")
+        return False
+    try:
+        from pymongo import MongoClient, ASCENDING
+        from pymongo.server_api import ServerApi
+        _mongo_client = MongoClient(uri, server_api=ServerApi("1"),
+                                    serverSelectionTimeoutMS=8000,
+                                    connectTimeoutMS=8000)
+        _mongo_client.admin.command("ping")   # verify connection
+        db = _mongo_client["nexus_stock"]
+        _mongo_col = db["paper_trades"]
+        _mongo_col.create_index([("stock_id", ASCENDING), ("status", ASCENDING)])
+        _mongo_col.create_index([("time", ASCENDING)])
+        print("[MONGO] Connected to Atlas — paper trades will persist across restarts")
+        return True
+    except Exception as e:
+        print(f"[MONGO] Connection failed ({e}) — running in-memory only")
+        _mongo_client = None
+        _mongo_col    = None
+        return False
+
+_mongo_ok = _mongo_connect()
+
+def _db_connected(): return _mongo_ok and _mongo_col is not None
+
+def _mongo_upsert(trade: dict):
+    """Write or update a trade document in MongoDB (fire-and-forget)."""
+    if not _db_connected(): return
+    try:
+        doc = {k: v for k, v in trade.items() if k != "_id"}
+        _mongo_col.update_one({"id": trade["id"]}, {"$set": doc}, upsert=True)
+    except Exception as e:
+        print(f"[MONGO] upsert error: {e}")
+
+def _mongo_load_open_trades() -> list:
+    """Load all OPEN trades from MongoDB on startup."""
+    if not _db_connected(): return []
+    try:
+        docs = list(_mongo_col.find({"status": "OPEN"}, {"_id": 0}))
+        print(f"[MONGO] Restored {len(docs)} open paper trade(s) from Atlas")
+        return docs
+    except Exception as e:
+        print(f"[MONGO] load error: {e}")
+        return []
 
 # ── Local retrieval model ─────────────────────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "model"))
@@ -499,8 +548,8 @@ _signal_history      = []
 _signal_history_lock = threading.Lock()
 
 # ── Backend paper trading — in-memory, no browser required ───────────────────
-_paper_trades = []   # list of trade dicts; survives as long as server is up
 _paper_lock   = threading.Lock()
+_paper_trades = _mongo_load_open_trades()   # restored from Atlas; [] if unavailable
 
 # ── Broadcast SSE ─────────────────────────────────────────────────────────────
 subscribers = []
@@ -706,6 +755,7 @@ def _paper_log(stock_info, market, direction, conf, price, t1, t2, stop, rr):
         if len(_paper_trades) > 500:
             _paper_trades[:] = _paper_trades[-500:]
         print(f"[PAPER] {direction} {stock_info['id']} @ {price:.4f}  TP1={t1:.4f}  SL={stop:.4f}  conf={conf}%")
+        _mongo_upsert(trade)
         broadcast({"type": "paper_trade_new", "trade": _sanitize(trade)})
         return True
 
@@ -727,8 +777,9 @@ def _paper_check_exits(stock_id, price):
                 t["exit_time"]  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 print(f"[PAPER] {'WIN ✓' if hit_tp else 'LOSS ✗'} {stock_id} exit @ {price:.4f}")
                 to_broadcast.append(_sanitize(t))
-    # Broadcast outside the lock — put_nowait across N queues should not hold _paper_lock
+    # Persist closes + broadcast outside the lock
     for trade in to_broadcast:
+        _mongo_upsert(trade)
         broadcast({"type": "paper_trade_closed", "trade": trade})
 
 
@@ -756,6 +807,7 @@ def _paper_expire_old(max_age_hours: int = 120):
                 t["exit_time"]  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 to_broadcast.append(_sanitize(t))
     for trade in to_broadcast:
+        _mongo_upsert(trade)
         broadcast({"type": "paper_trade_closed", "trade": trade})
 
 
@@ -1901,12 +1953,16 @@ def model_status():
 
 @app.route("/api/db_stats")
 def db_stats_route():
-    """Return Supabase connection status and accumulated data summary."""
-    try:
-        from database import get_data_summary, is_connected
-        return jsonify(get_data_summary())
-    except Exception as e:
-        return jsonify({"connected": False, "error": str(e)})
+    """Return MongoDB connection status and paper trade summary."""
+    with _paper_lock:
+        total  = len(_paper_trades)
+        open_  = sum(1 for t in _paper_trades if t["status"] == "OPEN")
+        closed = total - open_
+    return jsonify({
+        "connected": _db_connected(),
+        "backend":   "mongodb_atlas" if _db_connected() else "in_memory",
+        "trades":    {"total": total, "open": open_, "closed": closed},
+    })
 
 
 @app.route("/api/training_status")
@@ -1944,6 +2000,11 @@ def get_paper_trades_route():
 def reset_paper_trades_route():
     with _paper_lock:
         _paper_trades.clear()
+    if _db_connected():
+        try:
+            _mongo_col.delete_many({})
+        except Exception:
+            pass
     broadcast({"type": "paper_trades_reset"})
     return jsonify({"ok": True})
 

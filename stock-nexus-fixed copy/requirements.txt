@@ -23,8 +23,8 @@ Pillow>=10.0
 matplotlib>=3.7
 mplfinance>=0.12
 
-# ── Persistent storage (Supabase) ─────────────────────────────────────────────
-supabase>=2.0.0
+# ── Persistent storage (MongoDB Atlas) ────────────────────────────────────────
+pymongo[srv]>=4.6
 
 # ── Environment variable management ──────────────────────────────────────────
 python-dotenv>=1.0.0
