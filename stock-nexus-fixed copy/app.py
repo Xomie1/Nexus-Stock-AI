@@ -912,16 +912,16 @@ def _paper_run_scan():
                     if direction == "BEARISH" and price > sma200 * 1.01:
                         continue   # no shorts above SMA(200) — against the trend
 
-                if direction == "NEUTRAL" or conf < 72:
+                if direction == "NEUTRAL" or conf < 65:
                     continue
                 atr_m = max(rng / (price + 1e-9), 0.01)
                 if direction == "BULLISH":
-                    t1   = round(price * (1 + atr_m * 2.5), 4)
-                    t2   = round(price * (1 + atr_m * 5.0), 4)
+                    t1   = round(price * (1 + atr_m * 3.0), 4)   # 3×ATR → rr=2.0 exactly
+                    t2   = round(price * (1 + atr_m * 6.0), 4)
                     stop = round(price * (1 - atr_m * 1.5), 4)
                 else:
-                    t1   = round(price * (1 - atr_m * 2.5), 4)
-                    t2   = round(price * (1 - atr_m * 5.0), 4)
+                    t1   = round(price * (1 - atr_m * 3.0), 4)
+                    t2   = round(price * (1 - atr_m * 6.0), 4)
                     stop = round(price * (1 + atr_m * 1.5), 4)
                 # Minimum gap + directional sanity guards
                 if abs(t1 - price) / price < 0.01 or abs(stop - price) / price < 0.007:
@@ -931,7 +931,6 @@ def _paper_run_scan():
                 if direction == "BEARISH" and (t1 >= price or stop <= price):
                     continue
                 rr = round(abs(t1 - price) / (abs(price - stop) + 1e-9), 2)
-                # Minimum R:R 2.0:1 — below this the math doesn't work at 50% win rate
                 if rr < 2.0:
                     continue
                 _paper_log(s, mkt_type, direction, conf, price, t1, t2, stop, rr)
