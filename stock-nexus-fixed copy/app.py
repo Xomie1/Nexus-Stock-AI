@@ -669,8 +669,14 @@ def price_poll_thread():
 
 # ── Backend paper trading helpers ─────────────────────────────────────────────
 
+_SLIP_PCT   = 0.00075   # 0.075% slippage — realistic round-trip on Trading 212
+_COMMISSION = 0.0       # T212 charges no per-trade commission on fractional shares
+
 def _paper_log(stock_info, market, direction, conf, price, t1, t2, stop, rr):
     """Log a paper trade if no open position already exists for this stock."""
+    # Apply execution friction: entry filled at mid + slippage in trade direction
+    slip = price * _SLIP_PCT
+    effective_entry = round(float(price) + (slip if direction == "BULLISH" else -slip), 4)
     with _paper_lock:
         for t in _paper_trades:
             if t["stock_id"] == stock_info["id"] and t["status"] == "OPEN":
@@ -684,7 +690,8 @@ def _paper_log(stock_info, market, direction, conf, price, t1, t2, stop, rr):
             "color":      stock_info.get("color", "#22C55E"),
             "direction":  direction,
             "conf":       conf,
-            "entry":      round(float(price), 4),
+            "entry":      effective_entry,
+            "signal_price": round(float(price), 4),
             "stop":       round(float(stop), 4),
             "tp1":        round(float(t1), 4),
             "tp2":        round(float(t2), 4),
@@ -764,6 +771,14 @@ def _paper_run_scan():
     ]:
         if not _market_is_open(mkt_type):
             continue   # skip markets that are closed or it's a weekend
+        # Fetch macro regime once per market (6h cached) — regime veto and VIX scaling
+        try:
+            macro   = fetch_macro_regime(mkt_type)
+            mkt_vix = macro.get("vix", 18.0)
+            mkt_reg = macro.get("regime", "NEUTRAL")
+        except Exception:
+            mkt_vix = 18.0
+            mkt_reg = "NEUTRAL"
         for s in stock_list:
             try:
                 state  = mkt_data.get(s["id"], {})
@@ -809,7 +824,14 @@ def _paper_run_scan():
                     "rsi2":    rsi2_val,
                     "ibs":     ibs_val,
                 }
-                direction, conf, _ = rule_based_signal(ind, change)
+                direction, conf, _ = rule_based_signal(ind, change, vix=mkt_vix)
+
+                # VIX panic gate: suppress new BULLISH signals when markets are in crisis
+                if direction == "BULLISH" and mkt_vix > 30:
+                    continue
+                # Market regime gate: no longs in a structural BEAR regime
+                if direction == "BULLISH" and mkt_reg == "BEAR":
+                    continue
 
                 # SMA(200) trend gate: only trade in the direction of the long-term trend
                 if sma200 is not None and sma200 > 0:
@@ -837,6 +859,9 @@ def _paper_run_scan():
                 if direction == "BEARISH" and (t1 >= price or stop <= price):
                     continue
                 rr = round(abs(t1 - price) / (abs(price - stop) + 1e-9), 2)
+                # Minimum R:R 2.0:1 — below this the math doesn't work at 50% win rate
+                if rr < 2.0:
+                    continue
                 _paper_log(s, mkt_type, direction, conf, price, t1, t2, stop, rr)
             except Exception as _e:
                 pass
@@ -1192,20 +1217,25 @@ def fetch_weekly_trend(ticker):
         print(f"[WEEKLY] {ticker}: {e}")
         return None
 
-def rule_based_signal(ind, ch):
+def rule_based_signal(ind, ch, vix=None):
     b = br = 0
     rsi = ind["rsi"]; macd = ind["macd"]; bb = ind["bb_pct"]
     stoch = ind["stoch_k"]; adx = ind["adx"]
+    # Dynamic VIX scaling: mean-reversion signals lose edge in high-vol regimes
+    vix_scale = 1.0
+    if vix is not None:
+        if vix > 35:   vix_scale = 0.50   # extreme fear — halve mean-reversion weight
+        elif vix > 25: vix_scale = 0.70   # elevated vol — reduce weight
     # RSI(2) — highest-accuracy mean-reversion trigger (76-90% win rate when >SMA200)
     rsi2 = ind.get("rsi2", 50)
-    if rsi2 < 10:  b  += 5   # extreme oversold — strongest entry signal
-    elif rsi2 > 90: br += 5  # extreme overbought — strongest short signal
-    elif rsi2 < 20: b  += 3
-    elif rsi2 > 80: br += 3
+    if rsi2 < 10:  b  += 5 * vix_scale
+    elif rsi2 > 90: br += 5 * vix_scale
+    elif rsi2 < 20: b  += 3 * vix_scale
+    elif rsi2 > 80: br += 3 * vix_scale
     # IBS (Internal Bar Strength) — day's close position within High-Low range
     ibs = ind.get("ibs", 0.5)
-    if ibs < 0.20: b  += 3   # closed near day's low = mean-reversion buy
-    elif ibs > 0.80: br += 3  # closed near day's high = mean-reversion sell
+    if ibs < 0.20: b  += 3 * vix_scale
+    elif ibs > 0.80: br += 3 * vix_scale
     # RSI(14) — traditional momentum filter
     if rsi < 30: b += 3
     elif rsi > 70: br += 3
@@ -1227,7 +1257,7 @@ def rule_based_signal(ind, ch):
     # Confidence: blend bull% with absolute change strength for spread
     strength = min(10, abs(ch) * 3)
     conf = round(min(82, max(20, abs(bp - 50) * 1.8 + strength)))
-    if adx < 22 and direction != "NEUTRAL":
+    if adx < 25 and direction != "NEUTRAL":
         direction = "NEUTRAL"; conf = round(conf * 0.55)
     # Mean reversion filter — penalise signals that chase extended moves
     ema50 = ind.get("ema50", 0)
@@ -2253,6 +2283,19 @@ signal.signal(signal.SIGTERM, _shutdown)
 # Render spins down instances after ~15 min of inactivity, which freezes all
 # background threads (price poll, paper auto-scan, exit checker).
 # This thread self-pings /api/ping every 10 min to stay alive.
+@app.route("/api/regime")
+def api_regime():
+    """Current market regime + VIX for all three markets (dashboard display)."""
+    out = {}
+    for mkt in ("eu", "as", "us"):
+        try:
+            r = fetch_macro_regime(mkt)
+            out[mkt] = {"regime": r.get("regime","NEUTRAL"), "vix": r.get("vix", 18.0),
+                        "vix_wide_sl": r.get("vix_wide_sl", False)}
+        except Exception:
+            out[mkt] = {"regime": "NEUTRAL", "vix": 18.0, "vix_wide_sl": False}
+    return jsonify(out)
+
 @app.route("/api/ping")
 def api_ping():
     return jsonify({"ok": True, "t": int(time.time())})

@@ -84,9 +84,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     // Load paper trades from server (universal across devices)
     await loadPaperTradesFromServer();
 
-    // Morning brief on dashboard
+    // Morning brief + regime/VIX on dashboard
     loadMorningBrief();
+    loadRegime();
     setInterval(loadMorningBrief, 10 * 60 * 1000);
+    setInterval(loadRegime, 30 * 60 * 1000);   // regime cached 6h; refresh every 30min
 
     // Auto-scan: run 2s after load, then every 5 minutes
     setTimeout(() => runScan(true), 2000);
@@ -267,6 +269,11 @@ function updateDashKPIs() {
       <div class="kpi-label">TOP LOSER</div>
       <div class="kpi-val" style="color:var(--red)">${fPct(topLoser?.change||0)}</div>
       <div class="kpi-sub">${topLoser?.id||"—"}</div>
+    </div>
+    <div class="kpi-card" id="kpi-vix" style="--accent:#f59e0b">
+      <div class="kpi-label">VIX · REGIME</div>
+      <div class="kpi-val" id="kpi-vix-val" style="color:#f59e0b">—</div>
+      <div class="kpi-sub" id="kpi-vix-sub">loading…</div>
     </div>`;
 }
 
@@ -1080,6 +1087,29 @@ function exportPaperTradesCSV() {
   a.href = `/api/export/trades${qs}`;
   a.download = "";
   a.click();
+}
+
+// ── MARKET REGIME / VIX ────────────────────────────────
+async function loadRegime() {
+  try {
+    const res  = await fetch("/api/regime");
+    const data = await res.json();
+    const vixEl  = document.getElementById("kpi-vix-val");
+    const subEl  = document.getElementById("kpi-vix-sub");
+    if (!vixEl || !subEl) return;
+    const vixAvg = ((data.eu?.vix||18) + (data.as?.vix||18) + (data.us?.vix||18)) / 3;
+    const regimes = [data.eu?.regime, data.as?.regime, data.us?.regime];
+    const bearCount = regimes.filter(r => r === "BEAR").length;
+    const bullCount = regimes.filter(r => r === "BULL").length;
+    const overallReg = bearCount >= 2 ? "BEAR" : bullCount >= 2 ? "BULL" : "NEUTRAL";
+    const vixColor = vixAvg > 30 ? "var(--red)" : vixAvg > 20 ? "#f59e0b" : "var(--green)";
+    vixEl.textContent = vixAvg.toFixed(1);
+    vixEl.style.color = vixColor;
+    const regColor = overallReg === "BULL" ? "var(--green)" : overallReg === "BEAR" ? "var(--red)" : "var(--muted)";
+    subEl.innerHTML = `<span style="color:${regColor}">${overallReg}</span> regime`;
+    const card = document.getElementById("kpi-vix");
+    if (card) card.style.setProperty("--accent", vixColor);
+  } catch(e) { /* silent */ }
 }
 
 // ── MORNING BRIEF ──────────────────────────────────────
