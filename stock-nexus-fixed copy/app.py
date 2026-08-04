@@ -83,11 +83,15 @@ _RATE_WINDOW = 60.0
 def _rate_ok(ip: str) -> bool:
     now = time.time()
     with _rate_lock:
-        bucket = _rate_buckets.setdefault(ip, [])
-        _rate_buckets[ip] = [t for t in bucket if now - t < _RATE_WINDOW]
-        if len(_rate_buckets[ip]) >= _RATE_MAX:
+        bucket = _rate_buckets.get(ip, [])
+        bucket = [t for t in bucket if now - t < _RATE_WINDOW]
+        if len(bucket) >= _RATE_MAX:
+            _rate_buckets[ip] = bucket   # keep pruned list for next check
             return False
-        _rate_buckets[ip].append(now)
+        bucket.append(now)
+        _rate_buckets[ip] = bucket
+        if len(bucket) == 0:             # all timestamps expired — evict key
+            del _rate_buckets[ip]
         return True
 
 # ── Numpy JSON serialiser ─────────────────────────────────────────────────────
@@ -661,7 +665,7 @@ def price_poll_thread():
         broadcast({"type": "status", "status": "simulated"})
         time.sleep(15)
 
-threading.Thread(target=price_poll_thread, daemon=True).start()
+# price_poll_thread started below, after _paper_check_exits is defined
 
 # ── Backend paper trading helpers ─────────────────────────────────────────────
 
@@ -685,11 +689,11 @@ def _paper_log(stock_info, market, direction, conf, price, t1, t2, stop, rr):
             "tp1":        round(float(t1), 4),
             "tp2":        round(float(t2), 4),
             "rr":         round(float(rr), 2),
-            "open_time":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "time":       time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "status":     "OPEN",
             "result":     None,
             "exit_price": None,
-            "close_time": None,
+            "exit_time":  None,
         }
         _paper_trades.append(trade)
         if len(_paper_trades) > 500:
@@ -701,29 +705,65 @@ def _paper_log(stock_info, market, direction, conf, price, t1, t2, stop, rr):
 
 def _paper_check_exits(stock_id, price):
     """Called on every price tick — close trades that hit TP1 or SL."""
+    to_broadcast = []
     with _paper_lock:
         for t in _paper_trades:
             if t["stock_id"] != stock_id or t["status"] != "OPEN":
                 continue
-            is_long  = t["direction"] == "BULLISH"
-            hit_tp   = price >= t["tp1"] if is_long else price <= t["tp1"]
-            hit_sl   = price <= t["stop"] if is_long else price >= t["stop"]
+            is_long = t["direction"] == "BULLISH"
+            hit_tp  = price >= t["tp1"] if is_long else price <= t["tp1"]
+            hit_sl  = price <= t["stop"] if is_long else price >= t["stop"]
             if hit_tp or hit_sl:
                 t["status"]     = "CLOSED"
                 t["result"]     = "WIN" if hit_tp else "LOSS"
                 t["exit_price"] = round(float(t["tp1"] if hit_tp else t["stop"]), 4)
-                t["close_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                t["exit_time"]  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 print(f"[PAPER] {'WIN ✓' if hit_tp else 'LOSS ✗'} {stock_id} exit @ {price:.4f}")
-                broadcast({"type": "paper_trade_closed", "trade": _sanitize(t)})
+                to_broadcast.append(_sanitize(t))
+    # Broadcast outside the lock — put_nowait across N queues should not hold _paper_lock
+    for trade in to_broadcast:
+        broadcast({"type": "paper_trade_closed", "trade": trade})
+
+
+def _paper_expire_old(max_age_hours: int = 120):
+    """Auto-close open paper trades older than max_age_hours at mid-price (timeout)."""
+    now = time.time()
+    cutoff = now - max_age_hours * 3600
+    to_broadcast = []
+    with _paper_lock:
+        for t in _paper_trades:
+            if t["status"] != "OPEN":
+                continue
+            opened_ts = 0
+            try:
+                import datetime as _dt
+                opened_ts = _dt.datetime.fromisoformat(
+                    t["time"].replace("Z", "+00:00")).timestamp()
+            except Exception:
+                continue
+            if opened_ts < cutoff:
+                mid = round((t["tp1"] + t["stop"]) / 2, 4)
+                t["status"]     = "CLOSED"
+                t["result"]     = "EXPIRED"
+                t["exit_price"] = mid
+                t["exit_time"]  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                to_broadcast.append(_sanitize(t))
+    for trade in to_broadcast:
+        broadcast({"type": "paper_trade_closed", "trade": trade})
 
 
 def _paper_run_scan():
     """Scan all markets, log strong signals as server-side paper trades."""
+    # Auto-close stale open positions older than 5 trading days to unblock dedup
+    _paper_expire_old(max_age_hours=120)
+
     for stock_list, mkt_data, mkt_type in [
         (EU_STOCKS,   market_eu, "eu"),
         (ASIA_STOCKS, market_as, "as"),
         (US_STOCKS,   market_us, "us"),
     ]:
+        if not _market_is_open(mkt_type):
+            continue   # skip markets that are closed or it's a weekend
         for s in stock_list:
             try:
                 state  = mkt_data.get(s["id"], {})
@@ -732,15 +772,53 @@ def _paper_run_scan():
                 high   = float(state.get("high", price * 1.02))
                 low    = float(state.get("low",  price * 0.98))
                 rng    = high - low or price * 0.02
+                atr_pct = rng / (price + 1e-9) * 100
+
+                # Pull real RSI(2), IBS, SMA(200) from OHLCV cache (1y daily)
+                ticker    = s.get("yf", s["id"])
+                cache_key = f"{ticker}_1y_1d"
+                df_c      = _ohlcv_cache.get(cache_key)
+                rsi2_val = 50.0
+                ibs_val  = (price - low) / (rng + 1e-9)   # fallback from intraday range
+                sma200   = None
+                if df_c is not None and len(df_c) >= 10:
+                    try:
+                        c_ = df_c["Close"]
+                        h_ = df_c["High"]
+                        l_ = df_c["Low"]
+                        rsi2_s = _rsi(c_, 2)
+                        rsi2_clean = rsi2_s.dropna()
+                        if len(rsi2_clean) > 0:
+                            rsi2_val = float(rsi2_clean.iloc[-1])
+                        lh = float(h_.iloc[-1]); ll = float(l_.iloc[-1]); lc = float(c_.iloc[-1])
+                        ibs_val = (lc - ll) / (lh - ll + 1e-9)
+                        if len(c_) >= 200:
+                            sma200 = float(c_.rolling(200).mean().iloc[-1])
+                    except Exception:
+                        pass
+
                 ind = {
                     "rsi":     min(98, max(2, 50 + change * 4.2)),
                     "macd":    "BULLISH" if change > 0 else "BEARISH",
                     "bb_pct":  ((price - low) / rng) * 100,
                     "stoch_k": ((price - low) / rng) * 100,
                     "adx":     min(80, max(10, abs(change) * 8 + 20)),
+                    "ema50":   price,
+                    "price":   price,
+                    "atr":     atr_pct,
+                    "rsi2":    rsi2_val,
+                    "ibs":     ibs_val,
                 }
                 direction, conf, _ = rule_based_signal(ind, change)
-                if direction == "NEUTRAL" or conf < 68:
+
+                # SMA(200) trend gate: only trade in the direction of the long-term trend
+                if sma200 is not None and sma200 > 0:
+                    if direction == "BULLISH" and price < sma200 * 0.99:
+                        continue   # no longs below SMA(200) — against the trend
+                    if direction == "BEARISH" and price > sma200 * 1.01:
+                        continue   # no shorts above SMA(200) — against the trend
+
+                if direction == "NEUTRAL" or conf < 72:
                     continue
                 atr_m = max(rng / (price + 1e-9), 0.01)
                 if direction == "BULLISH":
@@ -777,8 +855,7 @@ def _paper_auto_scan_loop():
 
 threading.Thread(target=_paper_auto_scan_loop, daemon=True).start()
 
-# Background OHLCV refresh loop — runs at startup then every 50 minutes so
-# the cache never expires under live user traffic (TTL is 60 min).
+# Background OHLCV refresh loop — defined here, started after _batch_prefetch_ohlcv is defined
 def _ohlcv_refresh_loop():
     all_tickers = (
         [s["yf"] for s in EU_STOCKS   if s.get("yf")] +
@@ -786,9 +863,9 @@ def _ohlcv_refresh_loop():
         [s["yf"] for s in US_STOCKS   if s.get("yf")]
     )
     while True:
-        _batch_prefetch_ohlcv(all_tickers, period="120d", interval="1d", batch_size=30)
+        _batch_prefetch_ohlcv(all_tickers, period="1y", interval="1d", batch_size=30)
         time.sleep(50 * 60)   # 50 minutes — refresh before 60-min TTL expires
-threading.Thread(target=_ohlcv_refresh_loop, daemon=True).start()
+# _ohlcv_refresh_loop thread started below, after _batch_prefetch_ohlcv is defined
 
 # ── Technical indicator helpers ───────────────────────────────────────────────
 def _rsi(s, p=14):
@@ -884,7 +961,11 @@ def _batch_prefetch_ohlcv(tickers: list, period="120d", interval="1d", batch_siz
         time.sleep(1)   # 1s gap between batches to stay Yahoo-friendly
     print(f"[BATCH OHLCV] Cache warmed: {len(_ohlcv_cache)} tickers")
 
-def fetch_ohlcv_stock(ticker, period="120d", interval="1d"):
+# Start background threads now that all helpers are defined
+threading.Thread(target=price_poll_thread, daemon=True).start()
+threading.Thread(target=_ohlcv_refresh_loop, daemon=True).start()
+
+def fetch_ohlcv_stock(ticker, period="1y", interval="1d"):
     if not _yf_ok or not ticker:
         return None
     cache_key = f"{ticker}_{period}_{interval}"
@@ -942,6 +1023,7 @@ def compute_indicators(df):
 
     rsi14  = _rsi(c, 14)
     rsi7   = _rsi(c, 7)
+    rsi2   = _rsi(c, 2)
     ml, sl_, hist = _macd(c)
     bb_up, bb_mid, bb_lo, pct_b, bw = _bollinger(c)
     atr14  = _atr(h, l, c, 14)
@@ -959,6 +1041,7 @@ def compute_indicators(df):
 
     rsi_v    = last(rsi14)
     rsi7_v   = last(rsi7)
+    rsi2_v   = last(rsi2)
     macd_l   = last(ml)
     macd_s   = last(sl_)
     macd_h   = last(hist)
@@ -981,6 +1064,13 @@ def compute_indicators(df):
     macd_dir = "BULLISH" if macd_l > macd_s else "BEARISH"
     atr_pct  = atr_v / price * 100 if price > 0 else 0
 
+    # IBS: Internal Bar Strength — where close sits within the day's range
+    ibs_v = (float(c.iloc[-1]) - float(l.iloc[-1])) / (float(h.iloc[-1]) - float(l.iloc[-1]) + 1e-9)
+
+    # SMA-200 for trend gate
+    sma200_s = c.rolling(200).mean()
+    sma200_v = last(sma200_s)
+
     # Candle pattern
     body = abs(float(c.iloc[-1]) - float(o.iloc[-1]))
     rng  = max(float(h.iloc[-1]) - float(l.iloc[-1]), 1e-9)
@@ -993,12 +1083,14 @@ def compute_indicators(df):
     else: candle = "BULLISH BAR" if float(c.iloc[-1]) > float(o.iloc[-1]) else "BEARISH BAR"
 
     return {
-        "rsi": round(rsi_v, 1), "rsi_7": round(rsi7_v, 1),
+        "rsi": round(rsi_v, 1), "rsi_7": round(rsi7_v, 1), "rsi2": round(rsi2_v, 1),
         "macd": macd_dir, "macd_line": round(macd_l, 4), "macd_hist": round(macd_h, 4),
         "bb_pct": round(bb_pct, 1), "bb_upper": round(bb_u, 2), "bb_lower": round(bb_lo_v, 2),
         "atr": round(atr_pct, 4), "atr_raw": round(atr_v, 2),
         "ema9": round(ema9_v, 2), "ema21": round(ema21_v, 2),
         "ema50": round(ema50_v, 2), "ema200": round(ema200_v, 2),
+        "sma200": round(sma200_v, 2),
+        "ibs": round(ibs_v, 3),
         "stoch_k": round(stoch_k, 1), "stoch_d": round(stoch_d, 1),
         "adx": round(adx_v, 1), "plus_di": round(pdi_v, 1), "minus_di": round(mdi_v, 1),
         "vol_ratio": round(vol_r, 2), "candle": candle, "price": round(price, 2),
@@ -1021,9 +1113,11 @@ MARKET_HOURS_UTC = {
 
 def _market_is_open(market_type: str) -> bool:
     import datetime as _dt
-    now_h = _dt.datetime.utcnow().hour
+    now = _dt.datetime.utcnow()
+    if now.weekday() >= 5:   # Saturday=5, Sunday=6
+        return False
     lo, hi = MARKET_HOURS_UTC.get(market_type, (0, 24))
-    return lo <= now_h < hi
+    return lo <= now.hour < hi
 
 _BENCHMARKS = {"eu": "VGK", "as": "AAXJ", "us": "SPY"}
 
@@ -1102,9 +1196,20 @@ def rule_based_signal(ind, ch):
     b = br = 0
     rsi = ind["rsi"]; macd = ind["macd"]; bb = ind["bb_pct"]
     stoch = ind["stoch_k"]; adx = ind["adx"]
+    # RSI(2) — highest-accuracy mean-reversion trigger (76-90% win rate when >SMA200)
+    rsi2 = ind.get("rsi2", 50)
+    if rsi2 < 10:  b  += 5   # extreme oversold — strongest entry signal
+    elif rsi2 > 90: br += 5  # extreme overbought — strongest short signal
+    elif rsi2 < 20: b  += 3
+    elif rsi2 > 80: br += 3
+    # IBS (Internal Bar Strength) — day's close position within High-Low range
+    ibs = ind.get("ibs", 0.5)
+    if ibs < 0.20: b  += 3   # closed near day's low = mean-reversion buy
+    elif ibs > 0.80: br += 3  # closed near day's high = mean-reversion sell
+    # RSI(14) — traditional momentum filter
     if rsi < 30: b += 3
     elif rsi > 70: br += 3
-    elif rsi < 45: b += 1          # slightly tighter neutral zone
+    elif rsi < 45: b += 1
     elif rsi > 55: br += 1
     if macd == "BULLISH": b += 3
     else: br += 3
@@ -1112,7 +1217,7 @@ def rule_based_signal(ind, ch):
     elif bb > 80: br += 2
     if stoch < 20: b += 2
     elif stoch > 80: br += 2
-    if ch > 1.5: b += 2            # require stronger move for bonus
+    if ch > 1.5: b += 2
     elif ch < -1.5: br += 2
     elif ch > 0.5: b += 1
     elif ch < -0.5: br += 1
@@ -1855,7 +1960,7 @@ def export_trades():
     # Average P&L % for closed trades (approx: winner ~TP1 gap, loser ~SL gap)
     pnl_vals = []
     for t in closed:
-        ep = t.get("entry_price", 0)
+        ep = t.get("entry") or t.get("entry_price", 0)
         if ep and ep > 0:
             if t.get("result") == "WIN":
                 pnl_vals.append(round((t.get("tp1", ep) - ep) / ep * 100, 2))
@@ -1895,7 +2000,7 @@ def export_trades():
                 "Entry", "Stop", "TP1", "TP2", "R:R",
                 "Status", "Result", "Exit Price", "Exit Time", "P&L %"])
     for t in all_trades:
-        ep = t.get("entry_price") or 0
+        ep = t.get("entry") or t.get("entry_price") or 0
         pnl = ""
         if ep > 0:
             if t.get("result") == "WIN":
@@ -1903,8 +2008,8 @@ def export_trades():
             elif t.get("result") == "LOSS":
                 pnl = f"{round((t.get('stop', ep) - ep) / ep * 100, 2)}%"
         w.writerow([
-            t.get("time", ""), t.get("market", ""), t.get("stock", ""),
-            t.get("direction", ""), f"{t.get('confidence', '')}%",
+            t.get("time", ""), t.get("market", ""), t.get("stock_id", t.get("stock", "")),
+            t.get("direction", ""), f"{t.get('conf', t.get('confidence', ''))}%",
             ep, t.get("stop", ""), t.get("tp1", ""), t.get("tp2", ""),
             t.get("rr", ""), t.get("status", ""), t.get("result", ""),
             t.get("exit_price", ""), t.get("exit_time", ""), pnl,
@@ -2143,6 +2248,28 @@ def _shutdown(signum=None, frame=None):
 import signal
 signal.signal(signal.SIGINT,  _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
+
+# ── Keepalive ping — prevents Render free-tier from sleeping ─────────────────
+# Render spins down instances after ~15 min of inactivity, which freezes all
+# background threads (price poll, paper auto-scan, exit checker).
+# This thread self-pings /api/ping every 10 min to stay alive.
+@app.route("/api/ping")
+def api_ping():
+    return jsonify({"ok": True, "t": int(time.time())})
+
+def _keepalive_loop():
+    time.sleep(120)   # wait for server to finish starting
+    base = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if not base:
+        return   # not on Render — no-op locally
+    while True:
+        try:
+            requests.get(f"{base}/api/ping", timeout=10)
+        except Exception:
+            pass
+        time.sleep(600)   # 10 minutes
+
+threading.Thread(target=_keepalive_loop, daemon=True).start()
 
 # ── Retraining scheduler — start once at module load time ────────────────────
 _scheduler = None
