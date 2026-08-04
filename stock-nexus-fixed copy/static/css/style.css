@@ -157,7 +157,7 @@ html, body {
 
 .page-wrap {
   flex: 1; overflow-y: auto; overflow-x: hidden;
-  padding: 20px 22px 40px;
+  padding: 14px 20px 30px;
   scroll-behavior: smooth;
 }
 
@@ -184,14 +184,14 @@ html, body {
   background: var(--bg2);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 16px;
+  padding: 12px 14px;
   transition: border-color 0.2s;
 }
 
 .section-title {
   font-family: var(--font-mono); font-size: 9px;
-  letter-spacing: 2px; color: var(--text3);
-  text-transform: uppercase; margin-bottom: 12px;
+  letter-spacing: 1px; color: var(--text3);
+  text-transform: uppercase; margin-bottom: 10px;
 }
 .ngx-label { color: var(--ng-green); }
 .us-label  { color: var(--us-blue);  }
@@ -201,24 +201,24 @@ html, body {
 /* ── KPI GRID ───────────────────────────────────────── */
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
 }
 .kpi-card {
   background: var(--bg2);
   border: 1px solid var(--border);
   border-top: 2px solid var(--accent, var(--us-blue));
   border-radius: var(--radius);
-  padding: 14px; cursor: default;
-  transition: border-color 0.2s, transform 0.15s;
+  padding: 12px; cursor: default;
+  transition: border-color 0.2s;
 }
-.kpi-card:hover { transform: translateY(-1px); border-color: var(--border2); }
-.kpi-label { font-family: var(--font-mono); font-size: 8px; color: var(--text3); letter-spacing: 1.5px; margin-bottom: 6px; }
-.kpi-val   { font-family: var(--font-title); font-size: 28px; line-height: 1; }
-.kpi-sub   { font-family: var(--font-mono); font-size: 9px; color: var(--text3); margin-top: 4px; }
+.kpi-card:hover { border-color: var(--border2); }
+.kpi-label { font-family: var(--font-mono); font-size: 8px; color: var(--text3); letter-spacing: 1px; margin-bottom: 5px; }
+.kpi-val   { font-family: var(--font-title); font-size: 22px; line-height: 1; }
+.kpi-sub   { font-family: var(--font-mono); font-size: 9px; color: var(--text3); margin-top: 3px; }
 
 /* ── TWO-COL ────────────────────────────────────────── */
-.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
 /* ── PRICE COLORS ───────────────────────────────────── */
 .price-up      { color: var(--green) !important; }
@@ -424,12 +424,12 @@ html, body {
 /* ── EMPTY STATE ────────────────────────────────────── */
 .empty-state {
   display: flex; flex-direction: column; align-items: center;
-  justify-content: center; padding: 60px 20px;
+  justify-content: center; padding: 40px 20px;
   text-align: center;
 }
 .empty-title {
-  font-family: var(--font-title); font-size: 42px;
-  letter-spacing: 4px; color: var(--text3);
+  font-family: var(--font-title); font-size: 32px;
+  letter-spacing: 3px; color: var(--text3);
 }
 .empty-sub {
   font-family: var(--font-mono); font-size: 9px;
@@ -523,10 +523,10 @@ html, body {
 }
 .scan-card {
   background: var(--bg2); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 14px;
-  cursor: pointer; transition: border-color 0.2s, transform 0.15s;
+  border-radius: var(--radius); padding: 12px;
+  cursor: pointer; transition: border-color 0.2s;
 }
-.scan-card:hover { transform: translateY(-2px); border-color: var(--border2); }
+.scan-card:hover { border-color: var(--border2); }
 .scan-card.bull { border-top: 2px solid var(--green); }
 .scan-card.bear { border-top: 2px solid var(--red);   }
 .scan-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
@@ -840,36 +840,46 @@ html, body {
 
 /* ── MORNING BRIEF (Dashboard) ──────────────────────── */
 .morning-brief-wrap {
-  border: 1px solid var(--border2);
-  border-radius: 8px;
-  background: var(--bg3);
-  padding: 16px;
-  margin-top: 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg2);
+  padding: 10px 14px;
+  margin-top: 10px;
   margin-bottom: 4px;
 }
 .morning-brief-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 14px;
-  padding-bottom: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.morning-brief-wrap:not(.expanded) .morning-brief-cols { display: none; }
+.morning-brief-wrap.expanded .morning-brief-header {
+  margin-bottom: 12px;
+  padding-bottom: 8px;
   border-bottom: 1px solid var(--border);
+}
+.brief-toggle-btn {
+  font-family: var(--font-mono); font-size: 9px; color: var(--text3);
+  background: none; border: none; cursor: pointer; padding: 2px 6px;
+  letter-spacing: 0.5px;
 }
 .morning-brief-cols {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 16px;
+  gap: 12px;
 }
 .brief-mini-card {
   border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg4);
-  padding: 10px 12px;
-  margin-bottom: 8px;
+  border-radius: 4px;
+  background: var(--bg3);
+  padding: 8px 10px;
+  margin-bottom: 6px;
   cursor: pointer;
-  transition: border-color .2s, background .2s;
+  transition: border-color .15s;
 }
-.brief-mini-card:hover { border-color: var(--border2); background: var(--bg3); }
+.brief-mini-card:hover { border-color: var(--border2); }
 
 /* ── SIGNAL HISTORY (Scanner) ───────────────────────── */
 .sig-history-wrap {

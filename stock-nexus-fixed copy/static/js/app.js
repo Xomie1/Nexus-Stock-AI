@@ -147,8 +147,9 @@ function startSSE() {
     if (msg.type === "tick") handleTick(msg);
     if (msg.type === "status") setWsStatus(msg.status);
     if (msg.type === "paper_trade_new" || msg.type === "paper_trade_closed") {
-      // Reload paper trades from server when backend logs or closes a trade
-      loadPaperTradesFromServer();
+      // Debounce: a scan can log many trades in one pass — collapse burst into one fetch
+      clearTimeout(window._paperFetchTimer);
+      window._paperFetchTimer = setTimeout(loadPaperTradesFromServer, 600);
     }
     if (msg.type === "paper_trades_reset") {
       paperTrades = [];
@@ -298,31 +299,7 @@ function renderDashMovers() {
   document.getElementById("dash-ng-movers").innerHTML = euAsSorted.slice(0,5).map(s=>row(s, euMkt(s))).join("");
   document.getElementById("dash-us-movers").innerHTML = usSorted.slice(0,5).map(s=>row(s,"us")).join("");
 
-  // leaders / laggards
-  const allWithMkt = [
-    ...euStocks.map(s=>({...s, mkt:"eu", change: marketEu[s.id]?.change||0, price: marketEu[s.id]?.price||0})),
-    ...asiaStocks.map(s=>({...s, mkt:"as", change: marketAs[s.id]?.change||0, price: marketAs[s.id]?.price||0})),
-    ...usStocks.map(s=>({...s, mkt:"us", change: marketUs[s.id]?.change||0, price: marketUs[s.id]?.price||0}))
-  ];
-  const leaders  = [...allWithMkt].sort((a,b)=>b.change-a.change).slice(0,5);
-  const laggards = [...allWithMkt].sort((a,b)=>a.change-b.change).slice(0,5);
-
-  const mktFlag = m => m==="eu"?"🌍":m==="as"?"🌏":"🇺🇸";
-  const glRow = s => {
-    const sym = currSym(s.currency || "USD");
-    return `<div class="stock-row" onclick="quickSelect('${s.id}','${s.mkt}')">
-      <div style="display:flex;align-items:center;gap:8px">
-        <div class="stock-icon" style="background:${s.color}22;color:${s.color};width:24px;height:24px;font-size:7px">${s.id.slice(0,3)}</div>
-        <div>
-          <div style="font-size:11px;font-weight:700">${s.id}</div>
-          <div style="font-size:8px;color:var(--text3)">${mktFlag(s.mkt)} ${sym}${fpRaw(s.price)}</div>
-        </div>
-      </div>
-      <div style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:${chColor(s.change)}">${fPct(s.change)}</div>
-    </div>`;
-  };
-  document.getElementById("dash-leaders").innerHTML  = leaders.map(glRow).join("");
-  document.getElementById("dash-laggards").innerHTML = laggards.map(glRow).join("");
+  // leaders/laggards section removed from dashboard (deduplicated with movers)
 }
 
 function renderHeatmap() {
@@ -981,7 +958,7 @@ async function loadPaperTradesFromServer() {
 function normalisePaperTrade(t) {
   return {
     id:        t.id,
-    ticker:    t.ticker || t.id.split("_")[0],
+    ticker:    t.stock_id || t.ticker || t.id.split("_")[0],
     name:      t.name,
     market:    t.market,
     currency:  t.currency,
@@ -1060,7 +1037,7 @@ function renderPaperStats() {
     </span>
   </div>
   <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-bottom:12px">
-    Server auto-scans every 5 min. Strong signals (≥68% conf, TP1≥1% away) are logged automatically — even when the browser is closed. Wins = TP1 hit. Losses = SL hit.
+    Server auto-scans every 5 min during market hours. Strong signals (≥72% conf, TP1≥1% away) are logged automatically — even when the browser is closed. Wins = TP1 hit. Losses = SL hit.
   </div>
   <div class="paper-kpis">
     <div class="paper-kpi"><div class="pk-val" style="color:var(--cyan)">${open.length}</div><div class="pk-lbl">OPEN</div></div>
@@ -1083,7 +1060,7 @@ function renderPaperStats() {
   ${rowHtml([...closed].reverse(), false)}` : ""}
   ${!open.length && !closed.length ? `
   <div class="empty-state" style="padding:24px 0">
-    <div class="empty-sub">No paper trades yet.<br/>Auto-logs when a scan finds a signal ≥65% confidence.</div>
+    <div class="empty-sub">No paper trades yet.<br/>Auto-logs when a scan finds a signal ≥72% confidence during market hours.</div>
   </div>` : ""}`;
 }
 
@@ -1150,30 +1127,41 @@ function renderMorningBrief(data) {
     </div>`;
   }
 
+  // Preserve expanded state if the brief is re-rendered
+  const prevWrap = el.querySelector(".morning-brief-wrap");
+  const wasExpanded = prevWrap && prevWrap.classList.contains("expanded");
+
   el.innerHTML = `
-  <div class="morning-brief-wrap">
+  <div class="morning-brief-wrap${wasExpanded ? " expanded" : ""}" id="brief-wrap" onclick="toggleBrief(event)">
     <div class="morning-brief-header">
-      <div>
-        <div style="font-family:var(--font-title);font-size:16px;letter-spacing:2px">TODAY'S SIGNALS</div>
-        <div style="font-family:var(--font-mono);font-size:8px;color:var(--text3);margin-top:2px">${data.date} · ${data.time} · ${data.totalSignals} setups found</div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:1px">SIGNALS</span>
+        <span style="font-family:var(--font-mono);font-size:9px;color:${moodColor};font-weight:700">${data.marketMood}</span>
+        <span style="font-family:var(--font-mono);font-size:8px;color:var(--text3)">${longs.length}L · ${shorts.length}S · ${data.totalSignals} setups · ${data.time}</span>
       </div>
-      <div style="text-align:right">
-        <div style="font-family:var(--font-mono);font-size:8px;color:var(--text3)">MARKET MOOD</div>
-        <div style="font-family:var(--font-mono);font-size:12px;font-weight:700;color:${moodColor}">${data.marketMood}</div>
-        <div style="font-family:var(--font-mono);font-size:8px;color:var(--text3)">${data.bullPct}% BULLISH BIAS</div>
-      </div>
+      <button class="brief-toggle-btn" id="brief-toggle-lbl">${wasExpanded ? "▲ COLLAPSE" : "▼ EXPAND"}</button>
     </div>
     <div class="morning-brief-cols">
       <div>
-        <div style="font-family:var(--font-mono);font-size:9px;color:var(--green);letter-spacing:2px;margin-bottom:8px">▲ LONG SETUPS (${longs.length})</div>
-        ${longs.map(s => miniCard(s,"LONG")).join("") || '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text4);padding:10px 0">No bullish setups right now</div>'}
+        <div style="font-family:var(--font-mono);font-size:9px;color:var(--green);letter-spacing:1px;margin-bottom:8px">▲ LONG (${longs.length})</div>
+        ${longs.map(s => miniCard(s,"LONG")).join("") || '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text4);padding:8px 0">No bullish setups</div>'}
       </div>
       <div>
-        <div style="font-family:var(--font-mono);font-size:9px;color:var(--red);letter-spacing:2px;margin-bottom:8px">▼ SHORT SETUPS (${shorts.length})</div>
-        ${shorts.map(s => miniCard(s,"SHORT")).join("") || '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text4);padding:10px 0">No bearish setups right now</div>'}
+        <div style="font-family:var(--font-mono);font-size:9px;color:var(--red);letter-spacing:1px;margin-bottom:8px">▼ SHORT (${shorts.length})</div>
+        ${shorts.map(s => miniCard(s,"SHORT")).join("") || '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text4);padding:8px 0">No bearish setups</div>'}
       </div>
     </div>
   </div>`;
+}
+
+function toggleBrief(e) {
+  // Don't toggle when clicking the mini-cards inside
+  if (e.target.closest(".brief-mini-card")) return;
+  const wrap = document.getElementById("brief-wrap");
+  const lbl  = document.getElementById("brief-toggle-lbl");
+  if (!wrap) return;
+  wrap.classList.toggle("expanded");
+  if (lbl) lbl.textContent = wrap.classList.contains("expanded") ? "▲ COLLAPSE" : "▼ EXPAND";
 }
 
 // ── SCANNER ────────────────────────────────────────────────────
@@ -1236,7 +1224,6 @@ function renderScanResults(data, silent = false) {
       <span style="color:var(--green)">${bulls.length} BULLISH</span> ·
       <span style="color:var(--red)">${bears.length} BEARISH</span></span>
       <span style="font-size:8px;color:var(--text4)">AUTO-UPDATED ${lastScan} UTC · refreshes every 5 min</span>
-    </div>
     </div>
     <div class="scanner-grid">
       ${results.map(r => {
