@@ -44,57 +44,74 @@ except ImportError:
     pass  # python-dotenv optional — env vars still work via OS / Render dashboard
 
 # ── MongoDB Atlas persistence (graceful fallback to in-memory if unavailable) ──
+# pymongo's SSL handshake must run in a real OS thread — gevent's monkey-patched
+# SSL causes silent hangs when called from a greenlet at module load time.
+# We defer the connection to a background thread after the server starts.
 _mongo_client = None
-_mongo_col    = None   # paper_trades collection
+_mongo_col    = None
+_mongo_lock   = threading.Lock()   # guards _mongo_client / _mongo_col / _mongo_ok
+_mongo_ok     = False
 
 def _mongo_connect():
-    global _mongo_client, _mongo_col
+    """Run inside a real OS thread — never call directly from a greenlet."""
+    global _mongo_client, _mongo_col, _mongo_ok
     uri = os.environ.get("MONGODB_URI", "").strip()
     if not uri:
-        print("[MONGO] MONGODB_URI not set — running in-memory only")
-        return False
+        print("[MONGO] MONGODB_URI not set — running in-memory only", flush=True)
+        return
     try:
         from pymongo import MongoClient, ASCENDING
         from pymongo.server_api import ServerApi
-        _mongo_client = MongoClient(uri, server_api=ServerApi("1"),
-                                    serverSelectionTimeoutMS=8000,
-                                    connectTimeoutMS=8000)
-        _mongo_client.admin.command("ping")   # verify connection
-        db = _mongo_client["nexus_stock"]
-        _mongo_col = db["paper_trades"]
-        _mongo_col.create_index([("stock_id", ASCENDING), ("status", ASCENDING)])
-        _mongo_col.create_index([("time", ASCENDING)])
-        print("[MONGO] Connected to Atlas — paper trades will persist across restarts")
-        return True
+        client = MongoClient(uri, server_api=ServerApi("1"),
+                             serverSelectionTimeoutMS=10000,
+                             connectTimeoutMS=10000,
+                             socketTimeoutMS=10000)
+        client.admin.command("ping")
+        db  = client["nexus_stock"]
+        col = db["paper_trades"]
+        col.create_index([("stock_id", ASCENDING), ("status", ASCENDING)])
+        col.create_index([("time", ASCENDING)])
+        with _mongo_lock:
+            _mongo_client = client
+            _mongo_col    = col
+            _mongo_ok     = True
+        print("[MONGO] Connected to Atlas — paper trades will persist across restarts", flush=True)
+        # Load any open trades persisted from the last run
+        _mongo_restore_open_trades()
     except Exception as e:
-        print(f"[MONGO] Connection failed ({e}) — running in-memory only")
-        _mongo_client = None
-        _mongo_col    = None
-        return False
+        print(f"[MONGO] Connection failed: {e} — running in-memory only", flush=True)
 
-_mongo_ok = _mongo_connect()
-
-def _db_connected(): return _mongo_ok and _mongo_col is not None
-
-def _mongo_upsert(trade: dict):
-    """Write or update a trade document in MongoDB (fire-and-forget)."""
-    if not _db_connected(): return
-    try:
-        doc = {k: v for k, v in trade.items() if k != "_id"}
-        _mongo_col.update_one({"id": trade["id"]}, {"$set": doc}, upsert=True)
-    except Exception as e:
-        print(f"[MONGO] upsert error: {e}")
-
-def _mongo_load_open_trades() -> list:
-    """Load all OPEN trades from MongoDB on startup."""
-    if not _db_connected(): return []
+def _mongo_restore_open_trades():
+    """Pull open trades from Atlas into the in-memory list (called once after connect)."""
     try:
         docs = list(_mongo_col.find({"status": "OPEN"}, {"_id": 0}))
-        print(f"[MONGO] Restored {len(docs)} open paper trade(s) from Atlas")
-        return docs
+        if docs:
+            with _paper_lock:
+                existing_ids = {t["id"] for t in _paper_trades}
+                added = [d for d in docs if d["id"] not in existing_ids]
+                _paper_trades.extend(added)
+            print(f"[MONGO] Restored {len(docs)} open paper trade(s) from Atlas", flush=True)
     except Exception as e:
-        print(f"[MONGO] load error: {e}")
-        return []
+        print(f"[MONGO] restore error: {e}", flush=True)
+
+def _db_connected():
+    with _mongo_lock:
+        return _mongo_ok and _mongo_col is not None
+
+def _mongo_upsert(trade: dict):
+    """Fire-and-forget write to Atlas — submitted to thread pool to avoid greenlet SSL conflict."""
+    if not _db_connected(): return
+    def _do(t):
+        try:
+            col = _mongo_col
+            doc = {k: v for k, v in t.items() if k != "_id"}
+            col.update_one({"id": t["id"]}, {"$set": doc}, upsert=True)
+        except Exception as e:
+            print(f"[MONGO] upsert error: {e}", flush=True)
+    try:
+        _yf_pool.submit(_do, dict(trade))
+    except Exception:
+        pass
 
 # ── Local retrieval model ─────────────────────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "model"))
@@ -549,7 +566,7 @@ _signal_history_lock = threading.Lock()
 
 # ── Backend paper trading — in-memory, no browser required ───────────────────
 _paper_lock   = threading.Lock()
-_paper_trades = _mongo_load_open_trades()   # restored from Atlas; [] if unavailable
+_paper_trades = []   # open trades restored from Atlas after _mongo_connect() finishes
 
 # ── Broadcast SSE ─────────────────────────────────────────────────────────────
 subscribers = []
@@ -2374,6 +2391,9 @@ def _keepalive_loop():
         time.sleep(600)   # 10 minutes
 
 threading.Thread(target=_keepalive_loop, daemon=True).start()
+
+# MongoDB connect in a real OS thread — avoids gevent SSL greenlet conflict
+threading.Thread(target=_mongo_connect, daemon=True, name="mongo-connect").start()
 
 # ── Retraining scheduler — start once at module load time ────────────────────
 _scheduler = None
