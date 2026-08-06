@@ -868,6 +868,10 @@ def _paper_run_scan():
                 rsi2_val = 50.0
                 ibs_val  = (price - low) / (rng + 1e-9)   # fallback from intraday range
                 sma200   = None
+                pdi_val  = None   # +DI for refined ADX gate
+                mdi_val  = None   # -DI for refined ADX gate
+                ema5_val = None   # 5-day EMA for smart exit
+                adx_real = None   # real ADX from OHLCV
                 if df_c is not None and len(df_c) >= 10:
                     try:
                         c_ = df_c["Close"]
@@ -881,25 +885,73 @@ def _paper_run_scan():
                         ibs_val = (lc - ll) / (lh - ll + 1e-9)
                         if len(c_) >= 200:
                             sma200 = float(c_.rolling(200).mean().iloc[-1])
+                        # 5-day EMA for smart mean-reversion exit
+                        ema5_val = float(c_.ewm(span=5, adjust=False).mean().iloc[-1])
+                        # Real ADX + DMI from OHLCV for refined ADX gate
+                        if len(df_c) >= 14:
+                            adx_s, pdi_s, mdi_s = _adx(h_, l_, c_)
+                            pdi_clean = pdi_s.dropna(); mdi_clean = mdi_s.dropna()
+                            adx_clean = adx_s.dropna()
+                            if len(pdi_clean) > 0: pdi_val = float(pdi_clean.iloc[-1])
+                            if len(mdi_clean) > 0: mdi_val = float(mdi_clean.iloc[-1])
+                            if len(adx_clean) > 0: adx_real = float(adx_clean.iloc[-1])
                     except Exception:
                         pass
 
                 ind = {
-                    "rsi":     min(98, max(2, 50 + change * 4.2)),
                     "macd":    "BULLISH" if change > 0 else "BEARISH",
-                    "bb_pct":  ((price - low) / rng) * 100,
-                    "stoch_k": ((price - low) / rng) * 100,
-                    "adx":     min(80, max(10, abs(change) * 8 + 20)),
+                    "adx":     adx_real if adx_real is not None else min(80, max(10, abs(change) * 8 + 20)),
                     "ema50":   price,
                     "price":   price,
                     "atr":     atr_pct,
                     "rsi2":    rsi2_val,
                     "ibs":     ibs_val,
                 }
+                if pdi_val is not None: ind["plus_di"]  = pdi_val
+                if mdi_val is not None: ind["minus_di"] = mdi_val
                 direction, conf, _ = rule_based_signal(ind, change, vix=mkt_vix)
+
+                # ── Smart exit check for existing open trades on this stock ────
+                # Check mean-reversion completion before scanning for new entry.
+                # Exit longs when RSI(2) > 50 (bounce complete) or price > 5-EMA.
+                # Exit shorts when RSI(2) < 50 or price < 5-EMA.
+                if rsi2_val != 50.0 or ema5_val is not None:
+                    to_smart_close = []
+                    with _paper_lock:
+                        for _t in _paper_trades:
+                            if _t["stock_id"] != s["id"] or _t["status"] != "OPEN":
+                                continue
+                            _is_long = _t["direction"] == "BULLISH"
+                            _exit_reason = None
+                            if _is_long and rsi2_val > 50:
+                                _exit_reason = "RSI2>50 reversion complete"
+                            elif not _is_long and rsi2_val < 50:
+                                _exit_reason = "RSI2<50 reversion complete"
+                            elif _is_long and ema5_val is not None and price > ema5_val and price > _t["entry"]:
+                                _exit_reason = "Price closed above 5-EMA"
+                            elif not _is_long and ema5_val is not None and price < ema5_val and price < _t["entry"]:
+                                _exit_reason = "Price closed below 5-EMA"
+                            if _exit_reason:
+                                _t["status"]     = "CLOSED"
+                                _t["result"]     = "WIN" if (
+                                    (_is_long and price > _t["entry"]) or
+                                    (not _is_long and price < _t["entry"])
+                                ) else "LOSS"
+                                _t["exit_price"] = round(float(price), 4)
+                                _t["exit_time"]  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                _t["exit_reason"] = _exit_reason
+                                to_smart_close.append(_sanitize(_t))
+                                print(f"[PAPER SMART EXIT] {s['id']} @ {price:.4f} — {_exit_reason}")
+                    for _closed in to_smart_close:
+                        _mongo_upsert(_closed)
+                        broadcast({"type": "paper_trade_closed", "trade": _closed})
 
                 # VIX panic gate: suppress new BULLISH signals when markets are in crisis
                 if direction == "BULLISH" and mkt_vix > 30:
+                    continue
+                # VIX extreme gate: suppress new BEARISH (short) signals in panic spikes —
+                # VIX > 35 produces violent short-covering rallies that stop out shorts
+                if direction == "BEARISH" and mkt_vix > 35:
                     continue
                 # Market regime gate: no longs in a structural BEAR regime
                 if direction == "BULLISH" and mkt_reg == "BEAR":
@@ -908,31 +960,33 @@ def _paper_run_scan():
                 # SMA(200) trend gate: only trade in the direction of the long-term trend
                 if sma200 is not None and sma200 > 0:
                     if direction == "BULLISH" and price < sma200 * 0.99:
-                        continue   # no longs below SMA(200) — against the trend
+                        continue   # no longs below SMA(200)
                     if direction == "BEARISH" and price > sma200 * 1.01:
-                        continue   # no shorts above SMA(200) — against the trend
+                        continue   # no shorts above SMA(200)
 
-                if direction == "NEUTRAL" or conf < 65:
+                if direction == "NEUTRAL" or conf < 55:
                     continue
                 atr_m = max(rng / (price + 1e-9), 0.01)
+                # Targets aligned with mean-reversion horizon (analysis recommendation):
+                # TP1 = 1.5×ATR (hard ceiling fallback; primary exit is 5-EMA / RSI2>50)
+                # TP2 = 3×ATR  (extended target if bounce carries further)
+                # SL  = 1.5×ATR (unchanged — 1:1 R:R floor; win rate compensates)
                 if direction == "BULLISH":
-                    t1   = round(price * (1 + atr_m * 3.0), 4)   # 3×ATR → rr=2.0 exactly
-                    t2   = round(price * (1 + atr_m * 6.0), 4)
+                    t1   = round(price * (1 + atr_m * 1.5), 4)
+                    t2   = round(price * (1 + atr_m * 3.0), 4)
                     stop = round(price * (1 - atr_m * 1.5), 4)
                 else:
-                    t1   = round(price * (1 - atr_m * 3.0), 4)
-                    t2   = round(price * (1 - atr_m * 6.0), 4)
+                    t1   = round(price * (1 - atr_m * 1.5), 4)
+                    t2   = round(price * (1 - atr_m * 3.0), 4)
                     stop = round(price * (1 + atr_m * 1.5), 4)
                 # Minimum gap + directional sanity guards
-                if abs(t1 - price) / price < 0.01 or abs(stop - price) / price < 0.007:
+                if abs(t1 - price) / price < 0.005 or abs(stop - price) / price < 0.005:
                     continue
                 if direction == "BULLISH" and (t1 <= price or stop >= price):
                     continue
                 if direction == "BEARISH" and (t1 >= price or stop <= price):
                     continue
                 rr = round(abs(t1 - price) / (abs(price - stop) + 1e-9), 2)
-                if rr < 2.0:
-                    continue
                 _paper_log(s, mkt_type, direction, conf, price, t1, t2, stop, rr)
             except Exception as _e:
                 pass
@@ -1290,59 +1344,72 @@ def fetch_weekly_trend(ticker):
 
 def rule_based_signal(ind, ch, vix=None):
     b = br = 0
-    rsi = ind["rsi"]; macd = ind["macd"]; bb = ind["bb_pct"]
-    stoch = ind["stoch_k"]; adx = ind["adx"]
+    macd = ind["macd"]
+    adx  = ind["adx"]
+
     # Dynamic VIX scaling: mean-reversion signals lose edge in high-vol regimes
     vix_scale = 1.0
     if vix is not None:
         if vix > 35:   vix_scale = 0.50   # extreme fear — halve mean-reversion weight
         elif vix > 25: vix_scale = 0.70   # elevated vol — reduce weight
-    # RSI(2) — highest-accuracy mean-reversion trigger (76-90% win rate when >SMA200)
+
+    # ── Streamlined scoring (multicollinearity fix) ────────────────────────────
+    # RSI(14), Bollinger %B, Stochastic K and price-change all measure the same
+    # variance as RSI(2) + IBS. Keeping them inflates confidence without adding
+    # independent information. New max: RSI2(5) + IBS(3) + MACD(3) = 11 daily pts.
+
+    # RSI(2) — highest-accuracy mean-reversion trigger
     rsi2 = ind.get("rsi2", 50)
     if rsi2 < 10:  b  += 5 * vix_scale
     elif rsi2 > 90: br += 5 * vix_scale
     elif rsi2 < 20: b  += 3 * vix_scale
     elif rsi2 > 80: br += 3 * vix_scale
-    # IBS (Internal Bar Strength) — day's close position within High-Low range
+
+    # IBS (Internal Bar Strength) — intraday close location confirmation
     ibs = ind.get("ibs", 0.5)
     if ibs < 0.20: b  += 3 * vix_scale
     elif ibs > 0.80: br += 3 * vix_scale
-    # RSI(14) — traditional momentum filter
-    if rsi < 30: b += 3
-    elif rsi > 70: br += 3
-    elif rsi < 45: b += 1
-    elif rsi > 55: br += 1
+
+    # MACD — momentum direction (not redundant; measures trend, not range position)
     if macd == "BULLISH": b += 3
     else: br += 3
-    if bb < 20: b += 2
-    elif bb > 80: br += 2
-    if stoch < 20: b += 2
-    elif stoch > 80: br += 2
-    if ch > 1.5: b += 2
-    elif ch < -1.5: br += 2
-    elif ch > 0.5: b += 1
-    elif ch < -0.5: br += 1
-    T = b + br
+
+    T  = b + br
     bp = round(b / T * 100) if T else 50
     direction = "BULLISH" if bp >= 62 else "BEARISH" if bp <= 38 else "NEUTRAL"
-    # Confidence: blend bull% with absolute change strength for spread
-    strength = min(10, abs(ch) * 3)
-    conf = round(min(82, max(20, abs(bp - 50) * 1.8 + strength)))
-    if adx < 25 and direction != "NEUTRAL":
-        direction = "NEUTRAL"; conf = round(conf * 0.55)
+
+    # Confidence from raw signal strength (max 11 daily pts; weekly +2 applied externally)
+    raw_pts = b if direction == "BULLISH" else (br if direction == "BEARISH" else 0)
+    conf = round(min(92, max(20, raw_pts / 11 * 100)))
+
+    # ── Revised ADX gate (resolves trend vs. mean-reversion paradox) ──────────
+    # Allow: ADX < 20  (ranging market — ideal for mean reversion)
+    # Allow: ADX >= 25 AND DMI+ > DMI-  (uptrend pullback — buy dip safely)
+    # Veto:  20 <= ADX < 25  (ambiguous transition zone)
+    # Veto:  ADX >= 25 AND DMI- > DMI+  (strong downtrend — dangerous long)
+    pdi_ = ind.get("plus_di",  None)
+    mdi_ = ind.get("minus_di", None)
+    if pdi_ is not None and mdi_ is not None:
+        adx_ok = (adx < 20) or (adx >= 25 and pdi_ > mdi_)
+        if not adx_ok and direction != "NEUTRAL":
+            direction = "NEUTRAL"; conf = round(conf * 0.55)
+    else:
+        # Fallback when pdi/mdi not available (quick scan / brief endpoints)
+        if adx < 25 and direction != "NEUTRAL":
+            direction = "NEUTRAL"; conf = round(conf * 0.55)
+
     # Mean reversion filter — penalise signals that chase extended moves
-    ema50 = ind.get("ema50", 0)
+    ema50  = ind.get("ema50", 0)
     price_ = ind.get("price", 0)
     atr_pct = ind.get("atr", 0)
     if ema50 > 0 and atr_pct > 0 and price_ > 0:
         deviation_pct = (price_ - ema50) / ema50 * 100
-        atr_threshold = atr_pct * 2  # 2× ATR from EMA50 = extended
+        atr_threshold = atr_pct * 2
         if direction == "BULLISH" and deviation_pct > atr_threshold:
-            # Price too far above EMA50 — reduce bull confidence
             conf = round(conf * 0.80)
         elif direction == "BEARISH" and deviation_pct < -atr_threshold:
-            # Price too far below EMA50 — reduce bear confidence (may bounce)
             conf = round(conf * 0.80)
+
     return direction, conf, bp
 
 def swing_levels(df):
