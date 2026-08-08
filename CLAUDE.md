@@ -5,6 +5,13 @@
 Live at: https://nexus-stock-ty2t.onrender.com/
 GitHub (deployment repo): https://github.com/Xomie1/Nexus-Stock.git
 
+## Git Author Config (run at session start, every session)
+```bash
+git config --local user.name "Oloruntobiloba"
+git config --local user.email "tobiakindele30@gmail.com"
+```
+The repo's local `.git/config` is wiped on each fresh clone. Always run these two lines before the first commit so contributions count toward the GitHub profile.
+
 ## Critical: Two Repos, One Codebase
 
 | Repo | Purpose | Push access from this session |
