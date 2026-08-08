@@ -738,88 +738,129 @@ def price_poll_thread():
 
 # ── Backend paper trading helpers ─────────────────────────────────────────────
 
-_SLIP_PCT   = 0.00075   # 0.075% slippage — realistic round-trip on Trading 212
-_COMMISSION = 0.0       # T212 charges no per-trade commission on fractional shares
+_SLIP_PCT            = 0.00075  # 0.075% slippage applied at limit fill, not at signal time
+_COMMISSION          = 0.0      # T212 charges no per-trade commission on fractional shares
+_MAX_OPEN_POSITIONS  = 8        # portfolio-level cap — prevents over-exposure
+_MAX_SL_FRAC         = 0.04     # hard SL cap: 4% max stop distance regardless of ATR
+_LIMIT_OFFSET_FRAC   = 0.005    # 0.5% limit pullback below/above signal price
 
 def _paper_log(stock_info, market, direction, conf, price, t1, t2, stop, rr):
-    """Log a paper trade if no open position already exists for this stock."""
-    # Apply execution friction: entry filled at mid + slippage in trade direction
-    slip = price * _SLIP_PCT
-    effective_entry = round(float(price) + (slip if direction == "BULLISH" else -slip), 4)
+    """Log a paper trade as PENDING — emulates a limit order entry."""
+    limit_price = round(
+        price * (1 - _LIMIT_OFFSET_FRAC) if direction == "BULLISH"
+        else price * (1 + _LIMIT_OFFSET_FRAC), 4
+    )
     with _paper_lock:
+        # Portfolio cap — reject when already at max concurrent positions
+        active = sum(1 for t in _paper_trades if t["status"] in ("OPEN", "PENDING"))
+        if active >= _MAX_OPEN_POSITIONS:
+            return False
+        # Stock-level dedup — one active order per stock
         for t in _paper_trades:
-            if t["stock_id"] == stock_info["id"] and t["status"] == "OPEN":
+            if t["stock_id"] == stock_info["id"] and t["status"] in ("OPEN", "PENDING"):
                 return False
         trade = {
-            "id":         f"{stock_info['id']}_{int(time.time())}",
-            "stock_id":   stock_info["id"],
-            "name":       stock_info["name"],
-            "market":     market,
-            "currency":   stock_info.get("currency", "USD"),
-            "color":      stock_info.get("color", "#22C55E"),
-            "direction":  direction,
-            "conf":       conf,
-            "entry":      effective_entry,
+            "id":           f"{stock_info['id']}_{int(time.time())}",
+            "stock_id":     stock_info["id"],
+            "name":         stock_info["name"],
+            "market":       market,
+            "currency":     stock_info.get("currency", "USD"),
+            "color":        stock_info.get("color", "#22C55E"),
+            "direction":    direction,
+            "conf":         conf,
+            "entry":        None,           # populated at limit fill
+            "limit_price":  limit_price,
             "signal_price": round(float(price), 4),
-            "stop":       round(float(stop), 4),
-            "tp1":        round(float(t1), 4),
-            "tp2":        round(float(t2), 4),
-            "rr":         round(float(rr), 2),
-            "time":       time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "status":     "OPEN",
-            "result":     None,
-            "exit_price": None,
-            "exit_time":  None,
+            "stop":         round(float(stop), 4),
+            "tp1":          round(float(t1), 4),
+            "tp2":          round(float(t2), 4),
+            "rr":           round(float(rr), 2),
+            "time":         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "status":       "PENDING",
+            "result":       None,
+            "exit_price":   None,
+            "exit_time":    None,
         }
         _paper_trades.append(trade)
         if len(_paper_trades) > 500:
             _paper_trades[:] = _paper_trades[-500:]
-        print(f"[PAPER] {direction} {stock_info['id']} @ {price:.4f}  TP1={t1:.4f}  SL={stop:.4f}  conf={conf}%")
+        print(f"[PAPER] Limit placed: {direction} {stock_info['id']} limit @ {limit_price:.4f}  SL={stop:.4f}  conf={conf}%")
         _mongo_upsert(trade)
         broadcast({"type": "paper_trade_new", "trade": _sanitize(trade)})
         return True
 
 
 def _paper_check_exits(stock_id, price):
-    """Called on every price tick — close trades that hit TP1 or SL."""
+    """Called on every price tick — fills pending limit orders and manages OPEN exits."""
     to_broadcast = []
     with _paper_lock:
         for t in _paper_trades:
-            if t["stock_id"] != stock_id or t["status"] != "OPEN":
+            if t["stock_id"] != stock_id:
                 continue
             is_long = t["direction"] == "BULLISH"
-            hit_tp  = price >= t["tp1"] if is_long else price <= t["tp1"]
-            hit_sl  = price <= t["stop"] if is_long else price >= t["stop"]
-            if hit_tp or hit_sl:
-                t["status"]     = "CLOSED"
-                t["result"]     = "WIN" if hit_tp else "LOSS"
-                t["exit_price"] = round(float(t["tp1"] if hit_tp else t["stop"]), 4)
-                t["exit_time"]  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                print(f"[PAPER] {'WIN ✓' if hit_tp else 'LOSS ✗'} {stock_id} exit @ {price:.4f}")
-                to_broadcast.append(_sanitize(t))
-    # Persist closes + broadcast outside the lock
-    for trade in to_broadcast:
+
+            # Fill PENDING limit orders when price reaches limit_price
+            if t["status"] == "PENDING":
+                limit_hit = (price <= t["limit_price"]) if is_long else (price >= t["limit_price"])
+                if limit_hit:
+                    slip = t["limit_price"] * _SLIP_PCT
+                    fill = round(t["limit_price"] + (slip if is_long else -slip), 4)
+                    t["status"]        = "OPEN"
+                    t["entry"]         = fill
+                    t["time_executed"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    # Recalculate all exit levels relative to actual fill (preserves ATR distances)
+                    sl_dist = abs(t["signal_price"] - t["stop"])
+                    t1_dist = abs(t["tp1"] - t["signal_price"])
+                    t2_dist = abs(t["tp2"] - t["signal_price"])
+                    t["stop"] = round(fill - sl_dist if is_long else fill + sl_dist, 4)
+                    t["tp1"]  = round(fill + t1_dist if is_long else fill - t1_dist, 4)
+                    t["tp2"]  = round(fill + t2_dist if is_long else fill - t2_dist, 4)
+                    t["rr"]   = round(t1_dist / (sl_dist + 1e-9), 2)
+                    print(f"[PAPER] Limit FILLED: {stock_id} @ {fill:.4f}  SL={t['stop']:.4f}  TP1={t['tp1']:.4f}")
+                    to_broadcast.append((_sanitize(t), "paper_trade_filled"))
+                continue
+
+            # Manage hard TP1/SL exits for OPEN positions
+            # (RSI2>50 / 5-EMA smart exits handled separately in _paper_run_scan)
+            if t["status"] == "OPEN":
+                hit_tp = (price >= t["tp1"]) if is_long else (price <= t["tp1"])
+                hit_sl = (price <= t["stop"]) if is_long else (price >= t["stop"])
+                if hit_tp or hit_sl:
+                    t["status"]     = "CLOSED"
+                    t["result"]     = "WIN" if hit_tp else "LOSS"
+                    t["exit_price"] = round(float(t["tp1"] if hit_tp else t["stop"]), 4)
+                    t["exit_time"]  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    print(f"[PAPER] {'WIN ✓' if hit_tp else 'LOSS ✗'} {stock_id} exit @ {price:.4f}")
+                    to_broadcast.append((_sanitize(t), "paper_trade_closed"))
+
+    for trade, event_type in to_broadcast:
         _mongo_upsert(trade)
-        broadcast({"type": "paper_trade_closed", "trade": trade})
+        broadcast({"type": event_type, "trade": trade})
 
 
 def _paper_expire_old(max_age_hours: int = 120):
-    """Auto-close open paper trades older than max_age_hours at mid-price (timeout)."""
-    now = time.time()
-    cutoff = now - max_age_hours * 3600
-    to_broadcast = []
+    """Expire OPEN trades after max_age_hours; cancel PENDING limit orders after 24h."""
+    now            = time.time()
+    cutoff_open    = now - max_age_hours * 3600
+    cutoff_pending = now - 24 * 3600
+    to_broadcast   = []
     with _paper_lock:
         for t in _paper_trades:
-            if t["status"] != "OPEN":
+            if t["status"] not in ("OPEN", "PENDING"):
                 continue
-            opened_ts = 0
             try:
                 import datetime as _dt
                 opened_ts = _dt.datetime.fromisoformat(
                     t["time"].replace("Z", "+00:00")).timestamp()
             except Exception:
                 continue
-            if opened_ts < cutoff:
+            if t["status"] == "PENDING" and opened_ts < cutoff_pending:
+                t["status"]    = "CANCELLED"
+                t["result"]    = "UNFILLED"
+                t["exit_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                print(f"[PAPER] Limit CANCELLED (unfilled 24h): {t['stock_id']} limit={t['limit_price']}")
+                to_broadcast.append(_sanitize(t))
+            elif t["status"] == "OPEN" and opened_ts < cutoff_open:
                 mid = round((t["tp1"] + t["stop"]) / 2, 4)
                 t["status"]     = "CLOSED"
                 t["result"]     = "EXPIRED"
@@ -979,6 +1020,22 @@ def _paper_run_scan():
                     t1   = round(price * (1 - atr_m * 1.5), 4)
                     t2   = round(price * (1 - atr_m * 3.0), 4)
                     stop = round(price * (1 + atr_m * 1.5), 4)
+                # Hard SL cap: if ATR-based stop exceeds 4% of price, scale all
+                # levels proportionally so R:R is preserved but exposure is bounded.
+                if direction == "BULLISH":
+                    sl_frac = (price - stop) / price
+                    if sl_frac > _MAX_SL_FRAC:
+                        scale = _MAX_SL_FRAC / sl_frac
+                        stop  = round(price - (price - stop) * scale, 4)
+                        t1    = round(price + (t1 - price) * scale, 4)
+                        t2    = round(price + (t2 - price) * scale, 4)
+                else:
+                    sl_frac = (stop - price) / price
+                    if sl_frac > _MAX_SL_FRAC:
+                        scale = _MAX_SL_FRAC / sl_frac
+                        stop  = round(price + (stop - price) * scale, 4)
+                        t1    = round(price - (price - t1) * scale, 4)
+                        t2    = round(price - (price - t2) * scale, 4)
                 # Minimum gap + directional sanity guards
                 if abs(t1 - price) / price < 0.005 or abs(stop - price) / price < 0.005:
                     continue
@@ -1289,8 +1346,8 @@ def fetch_macro_regime(market_type: str) -> dict:
                 result["regime"] = "BULL"
             elif last < ema200 * 0.995:
                 result["regime"] = "BEAR"
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[MACRO WARNING] Regime fetch failed for {market_type}: {_e} — defaulting to NEUTRAL (gates still active)")
     try:
         df_vix = yf.download("^VIX", period="5d", interval="1d",
                              auto_adjust=True, progress=False, threads=False)
@@ -1298,8 +1355,8 @@ def fetch_macro_regime(market_type: str) -> dict:
             vix = float(df_vix["Close"].squeeze().iloc[-1])
             result["vix"]         = round(vix, 1)
             result["vix_wide_sl"] = vix > 25
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[MACRO WARNING] VIX fetch failed for {market_type}: {_e} — defaulting to VIX=18.0, BULLISH/BEARISH gates disabled")
     _macro_cache[market_type]    = result
     _macro_cache_ts[market_type] = now
     return result
