@@ -906,13 +906,14 @@ def _paper_run_scan():
                 ticker    = s.get("yf", s["id"])
                 cache_key = f"{ticker}_1y_1d"
                 df_c      = _ohlcv_cache.get(cache_key)
-                rsi2_val = 50.0
-                ibs_val  = (price - low) / (rng + 1e-9)   # fallback from intraday range
-                sma200   = None
-                pdi_val  = None   # +DI for refined ADX gate
-                mdi_val  = None   # -DI for refined ADX gate
-                ema5_val = None   # 5-day EMA for smart exit
-                adx_real = None   # real ADX from OHLCV
+                rsi2_val      = 50.0
+                ibs_val       = (price - low) / (rng + 1e-9)   # fallback from intraday range
+                sma200        = None
+                pdi_val       = None   # +DI for refined ADX gate
+                mdi_val       = None   # -DI for refined ADX gate
+                ema5_val      = None   # 5-day EMA for smart exit
+                adx_real      = None   # real ADX from OHLCV
+                atr_real_abs  = None   # real 14-day ATR in price units (for position sizing)
                 if df_c is not None and len(df_c) >= 10:
                     try:
                         c_ = df_c["Close"]
@@ -936,6 +937,12 @@ def _paper_run_scan():
                             if len(pdi_clean) > 0: pdi_val = float(pdi_clean.iloc[-1])
                             if len(mdi_clean) > 0: mdi_val = float(mdi_clean.iloc[-1])
                             if len(adx_clean) > 0: adx_real = float(adx_clean.iloc[-1])
+                            # Real 14-day ATR for position sizing — prevents session
+                            # high/low spread from inflating targets over multi-day runs
+                            atr_s = _atr(h_, l_, c_, 14)
+                            atr_clean = atr_s.dropna()
+                            if len(atr_clean) > 0:
+                                atr_real_abs = float(atr_clean.iloc[-1])
                     except Exception:
                         pass
 
@@ -1007,7 +1014,15 @@ def _paper_run_scan():
 
                 if direction == "NEUTRAL" or conf < 55:
                     continue
-                atr_m = max(rng / (price + 1e-9), 0.01)
+                # Use real 14-day OHLCV ATR for position sizing. The session
+                # high/low spread grows each day the server runs, producing
+                # unrealistic targets (ASML 34%, Samsung 71%). Real ATR gives
+                # a stable daily true-range baseline regardless of server uptime.
+                if atr_real_abs is not None:
+                    atr_m = atr_real_abs / (price + 1e-9)
+                else:
+                    atr_m = max(rng / (price + 1e-9), 0.01)
+                atr_m = max(atr_m, 0.005)   # floor at 0.5% to prevent degenerate trades
                 # Targets aligned with mean-reversion horizon (analysis recommendation):
                 # TP1 = 1.5×ATR (hard ceiling fallback; primary exit is 5-EMA / RSI2>50)
                 # TP2 = 3×ATR  (extended target if bounce carries further)
