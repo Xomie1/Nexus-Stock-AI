@@ -218,7 +218,7 @@ EU_STOCKS = [
     {"id":"DTE.DE",    "name":"Deutsche Telekom AG",   "sector":"Telecom",    "currency":"EUR","yf":"DTE.DE",    "color":"#E2007A"},
     # Switzerland
     {"id":"NESN.SW",   "name":"Nestle SA",             "sector":"Consumer",   "currency":"CHF","yf":"NESN.SW",   "color":"#F472B6"},
-    {"id":"ROG.SW",    "name":"Roche Holding AG",      "sector":"Healthcare", "currency":"CHF","yf":"ROG.SW",    "color":"#E63946"},
+    {"id":"RO.SW",     "name":"Roche Holding AG",      "sector":"Healthcare", "currency":"CHF","yf":"RO.SW",     "color":"#E63946"},
     {"id":"NOVN.SW",   "name":"Novartis AG",           "sector":"Healthcare", "currency":"CHF","yf":"NOVN.SW",   "color":"#FB923C"},
     # Netherlands
     {"id":"ASML.AS",   "name":"ASML Holding NV",       "sector":"Technology", "currency":"EUR","yf":"ASML.AS",   "color":"#00A3E0"},
@@ -372,7 +372,7 @@ EU_SEEDS = {
     "ADS.DE":{"price":218,"change":0.65,"high":220,"low":216,"vol":800000,"mktcap":"37B"},
     "DTE.DE":{"price":29.2,"change":0.21,"high":29.5,"low":29.0,"vol":8000000,"mktcap":"135B"},
     "NESN.SW":{"price":86.5,"change":-0.12,"high":87.2,"low":86.0,"vol":5000000,"mktcap":"228B"},
-    "ROG.SW":{"price":268,"change":0.35,"high":270,"low":266,"vol":1800000,"mktcap":"148B"},
+    "RO.SW": {"price":268,"change":0.35,"high":270,"low":266,"vol":1800000,"mktcap":"148B"},
     "NOVN.SW":{"price":91.5,"change":0.22,"high":92.2,"low":91.0,"vol":4000000,"mktcap":"195B"},
     "ASML.AS":{"price":712,"change":1.12,"high":718,"low":706,"vol":800000,"mktcap":"280B"},
     "NOVO-B.CO":{"price":645,"change":0.88,"high":651,"low":639,"vol":5000000,"mktcap":"288B"},
