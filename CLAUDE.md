@@ -21,9 +21,14 @@ The repo's local `.git/config` is wiped on each fresh clone. Always run these tw
 
 **Deployment command (run after every change):**
 ```bash
+rm -rf /tmp/nexus-deploy && mkdir /tmp/nexus-deploy
+cp -r "/home/user/Nexus-Stock-AI/stock-nexus-fixed copy/." /tmp/nexus-deploy/
+cd /tmp/nexus-deploy && git init && git config user.name "Oloruntobiloba" && git config user.email "tobiakindele30@gmail.com"
+git add -A && git commit -m "deploy: <version description>"
 git push --force https://github.com/Xomie1/Nexus-Stock.git HEAD:main
 ```
-The local proxy (port 41729) is unreliable — always use the direct HTTPS URL above.
+IMPORTANT: Always deploy from a fresh copy of `stock-nexus-fixed copy/` — NOT from the Nexus-Stock-AI repo root (Render needs files at root, not in a subdirectory).
+The local proxy (port 41729) is unreliable — always use the direct HTTPS URL.
 Render auto-redeploys ~3 min after push to Nexus-Stock main.
 
 ## Source Code Location
