@@ -568,8 +568,9 @@ _signal_history      = []
 _signal_history_lock = threading.Lock()
 
 # ── Backend paper trading — in-memory, no browser required ───────────────────
-_paper_lock   = threading.Lock()
-_paper_trades = []   # open trades restored from Atlas after _mongo_connect() finishes
+_paper_lock      = threading.Lock()
+_paper_trades    = []   # open trades restored from Atlas after _mongo_connect() finishes
+_loss_cooldown   = {}   # stock_id → timestamp of last SL loss (24h re-entry block)
 
 # ── Broadcast SSE ─────────────────────────────────────────────────────────────
 subscribers = []
@@ -755,6 +756,10 @@ def _paper_log(stock_info, market, direction, conf, price, t1, t2, stop, rr):
         active = sum(1 for t in _paper_trades if t["status"] in ("OPEN", "PENDING"))
         if active >= _MAX_OPEN_POSITIONS:
             return False
+        # Loss cooldown — block re-entry for 24h after a SL hit on this stock
+        last_loss_ts = _loss_cooldown.get(stock_info["id"], 0)
+        if time.time() - last_loss_ts < 86400:
+            return False
         # Stock-level dedup — one active order per stock
         for t in _paper_trades:
             if t["stock_id"] == stock_info["id"] and t["status"] in ("OPEN", "PENDING"):
@@ -830,6 +835,8 @@ def _paper_check_exits(stock_id, price):
                     t["result"]     = "WIN" if hit_tp else "LOSS"
                     t["exit_price"] = round(float(t["tp1"] if hit_tp else t["stop"]), 4)
                     t["exit_time"]  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    if hit_sl:
+                        _loss_cooldown[stock_id] = time.time()
                     print(f"[PAPER] {'WIN ✓' if hit_tp else 'LOSS ✗'} {stock_id} exit @ {price:.4f}")
                     to_broadcast.append((_sanitize(t), "paper_trade_closed"))
 
@@ -2206,15 +2213,18 @@ def export_trades():
         if t.get("result") == "WIN":   bucket["wins"] += 1
         if t.get("result") == "LOSS":  bucket["losses"] += 1
 
-    # Average P&L % for closed trades (approx: winner ~TP1 gap, loser ~SL gap)
+    # Average P&L % — directional: positive = profit regardless of long/short
     pnl_vals = []
     for t in closed:
         ep = t.get("entry") or t.get("entry_price", 0)
-        if ep and ep > 0:
-            if t.get("result") == "WIN":
-                pnl_vals.append(round((t.get("tp1", ep) - ep) / ep * 100, 2))
-            elif t.get("result") == "LOSS":
-                pnl_vals.append(round((t.get("stop", ep) - ep) / ep * 100, 2))
+        if not ep or ep <= 0:
+            continue
+        is_long = t.get("direction") == "BULLISH"
+        exit_p  = t.get("exit_price")
+        ref     = exit_p if exit_p else (t.get("tp1") if t.get("result") == "WIN" else t.get("stop"))
+        if ref:
+            raw = (ref - ep) / ep * 100
+            pnl_vals.append(round(raw if is_long else -raw, 2))
     avg_pnl = round(sum(pnl_vals) / len(pnl_vals), 2) if pnl_vals else None
 
     buf = io.StringIO()
@@ -2252,10 +2262,18 @@ def export_trades():
         ep = t.get("entry") or t.get("entry_price") or 0
         pnl = ""
         if ep > 0:
-            if t.get("result") == "WIN":
-                pnl = f"{round((t.get('tp1', ep) - ep) / ep * 100, 2)}%"
+            is_long = t.get("direction") == "BULLISH"
+            exit_p  = t.get("exit_price")
+            ref = None
+            if exit_p:
+                ref = exit_p
+            elif t.get("result") == "WIN":
+                ref = t.get("tp1")
             elif t.get("result") == "LOSS":
-                pnl = f"{round((t.get('stop', ep) - ep) / ep * 100, 2)}%"
+                ref = t.get("stop")
+            if ref:
+                raw = (ref - ep) / ep * 100
+                pnl = f"{round(raw if is_long else -raw, 2)}%"
         w.writerow([
             t.get("time", ""), t.get("market", ""), t.get("stock_id", t.get("stock", "")),
             t.get("direction", ""), f"{t.get('conf', t.get('confidence', ''))}%",
