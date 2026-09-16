@@ -978,10 +978,19 @@ def _paper_run_scan():
                                 continue
                             _is_long = _t["direction"] == "BULLISH"
                             _exit_reason = None
-                            if _is_long and rsi2_val > 50:
-                                _exit_reason = "RSI2>50 reversion complete"
-                            elif not _is_long and rsi2_val < 50:
-                                _exit_reason = "RSI2<50 reversion complete"
+                            # Min-profit gate: trade must be ≥35% of TP1 distance in profit
+                            # before any smart exit fires — prevents tiny-gain premature closes.
+                            _entry_px = _t.get("entry") or 0
+                            _tp1_px   = _t.get("tp1", _entry_px)
+                            if _entry_px > 0:
+                                _min_profit = abs(_tp1_px - _entry_px) * 0.35
+                                _unreal = (price - _entry_px) if _is_long else (_entry_px - price)
+                                if _unreal < _min_profit:
+                                    continue
+                            if _is_long and rsi2_val > 65:
+                                _exit_reason = "RSI2>65 reversion complete"
+                            elif not _is_long and rsi2_val < 35:
+                                _exit_reason = "RSI2<35 reversion complete"
                             elif _is_long and ema5_val is not None and price > ema5_val and price > _t["entry"]:
                                 _exit_reason = "Price closed above 5-EMA"
                             elif not _is_long and ema5_val is not None and price < ema5_val and price < _t["entry"]:
