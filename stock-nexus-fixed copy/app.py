@@ -1051,22 +1051,15 @@ def _paper_run_scan():
                     t1   = round(price * (1 - atr_m * 1.5), 4)
                     t2   = round(price * (1 - atr_m * 3.0), 4)
                     stop = round(price * (1 + atr_m * 1.5), 4)
-                # Hard SL cap: if ATR-based stop exceeds 4% of price, scale all
-                # levels proportionally so R:R is preserved but exposure is bounded.
+                # Skip signals where raw ATR-based SL exceeds 4% — capping and scaling
+                # still results in full -4% losses on wide-ATR stocks (9984.T, 005930.KS,
+                # ASML.AS), so rejecting them entirely is better than a false R:R guarantee.
                 if direction == "BULLISH":
                     sl_frac = (price - stop) / price
-                    if sl_frac > _MAX_SL_FRAC:
-                        scale = _MAX_SL_FRAC / sl_frac
-                        stop  = round(price - (price - stop) * scale, 4)
-                        t1    = round(price + (t1 - price) * scale, 4)
-                        t2    = round(price + (t2 - price) * scale, 4)
                 else:
                     sl_frac = (stop - price) / price
-                    if sl_frac > _MAX_SL_FRAC:
-                        scale = _MAX_SL_FRAC / sl_frac
-                        stop  = round(price + (stop - price) * scale, 4)
-                        t1    = round(price - (price - t1) * scale, 4)
-                        t2    = round(price - (price - t2) * scale, 4)
+                if sl_frac > _MAX_SL_FRAC:
+                    continue
                 # Minimum gap + directional sanity guards
                 if abs(t1 - price) / price < 0.005 or abs(stop - price) / price < 0.005:
                     continue
